@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+
+# Dataset artifacts must never be committed.
+animation/
+models/
+*.zip
+*.fbx
+*.glb
+*.blend
+*.npz
+*.npy
+*.png
+*.mp4
