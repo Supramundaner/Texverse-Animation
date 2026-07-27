@@ -454,13 +454,28 @@ FRONT_VIEW = {
 }
 
 
-def camera_distance_for_bounds(camera_data, minimum: np.ndarray, maximum: np.ndarray, view_direction: str) -> float:
+def effective_camera_half_tangents(scene, camera_data) -> tuple[float, float]:
+    """Return the rendered frame's horizontal and vertical half-FOV tangents."""
+    frame = camera_data.view_frame(scene=scene)
+    horizontal = max(abs(corner.x / corner.z) for corner in frame if abs(corner.z) > 1e-8)
+    vertical = max(abs(corner.y / corner.z) for corner in frame if abs(corner.z) > 1e-8)
+    return horizontal, vertical
+
+
+def camera_distance_for_bounds(
+    scene,
+    camera_data,
+    minimum: np.ndarray,
+    maximum: np.ndarray,
+    view_direction: str,
+) -> float:
     """Fit a perspective camera to projected bounds with five percent empty space per edge."""
     half_extent = 0.5 * (maximum - minimum)
     view = FRONT_VIEW
     usable_half_image = 0.90  # Five percent empty space on each image edge.
-    horizontal = half_extent[view["horizontal"]] / max(math.tan(camera_data.angle_x * 0.5) * usable_half_image, 1e-6)
-    vertical = half_extent[view["vertical"]] / max(math.tan(camera_data.angle_y * 0.5) * usable_half_image, 1e-6)
+    horizontal_tangent, vertical_tangent = effective_camera_half_tangents(scene, camera_data)
+    horizontal = half_extent[view["horizontal"]] / max(horizontal_tangent * usable_half_image, 1e-6)
+    vertical = half_extent[view["vertical"]] / max(vertical_tangent * usable_half_image, 1e-6)
     # The nearest depth bound, rather than the mesh centre, controls perspective cropping.
     return float(half_extent[view["depth"]] + max(horizontal, vertical, 0.001))
 
@@ -469,6 +484,11 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
     minimum = vertices.min(axis=0)
     maximum = vertices.max(axis=0)
     center = 0.5 * (minimum + maximum)
+    scene.render.resolution_x = resolution
+    scene.render.resolution_y = resolution
+    scene.render.resolution_percentage = 100
+    scene.render.pixel_aspect_x = 1.0
+    scene.render.pixel_aspect_y = 1.0
     camera_data = bpy.data.cameras.new("TexVerse_Camera")
     camera = bpy.data.objects.new("TexVerse_Camera", camera_data)
     scene.collection.objects.link(camera)
@@ -476,7 +496,7 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
     camera_data.type = "PERSP"
     camera_data.lens = 50.0
     view_direction = FRONT_VIEW["name"]
-    distance = camera_distance_for_bounds(camera_data, minimum, maximum, view_direction)
+    distance = camera_distance_for_bounds(scene, camera_data, minimum, maximum, view_direction)
     camera.location = tuple(center + FRONT_VIEW["offset"] * distance)
     camera.rotation_euler = (Vector(center) - camera.location).to_track_quat("-Z", "Y").to_euler()
     camera_data.clip_start = 0.001
@@ -500,9 +520,6 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
     scene.cycles.samples = 8
     scene.render.threads_mode = "FIXED"
     scene.render.threads = render_threads
-    scene.render.resolution_x = resolution
-    scene.render.resolution_y = resolution
-    scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "PNG"
     scene.use_nodes = False
     if scene.world is None:
@@ -521,11 +538,11 @@ def remove_export_render_helpers(scene) -> None:
             bpy.data.objects.remove(obj, do_unlink=True)
 
 
-def update_camera(camera, lights: list, vertices: np.ndarray, view_direction: str) -> dict:
+def update_camera(scene, camera, lights: list, vertices: np.ndarray, view_direction: str) -> dict:
     minimum = vertices.min(axis=0)
     maximum = vertices.max(axis=0)
     center = 0.5 * (minimum + maximum)
-    distance = camera_distance_for_bounds(camera.data, minimum, maximum, view_direction)
+    distance = camera_distance_for_bounds(scene, camera.data, minimum, maximum, view_direction)
     camera.location = tuple(center + FRONT_VIEW["offset"] * distance)
     camera.rotation_euler = (Vector(center) - camera.location).to_track_quat("-Z", "Y").to_euler()
     camera.data.clip_end = max(100.0, distance * 4.0)
@@ -725,7 +742,7 @@ def export_clip(
     bounds_max = np.max([vertices.max(axis=0) for vertices in animation_vertices], axis=0)
     bounds_vertices = np.stack((bounds_min, bounds_max))
     target_camera, target_lights, view_direction = configure_render(scene, args.resolution, bounds_vertices, args.render_threads)
-    target_camera_metadata = update_camera(target_camera, target_lights, bounds_vertices, view_direction)
+    target_camera_metadata = update_camera(scene, target_camera, target_lights, bounds_vertices, view_direction)
     final_root = args.output_root / Path(args.source_archive).parent / args.sample_id / str(clip_index)
     staging = args.output_root / ".staging" / Path(args.source_archive).parent / args.sample_id / str(clip_index)
     if staging.exists():

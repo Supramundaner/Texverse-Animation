@@ -13,6 +13,8 @@ renders, cameras, and manifests.
 - Keep a clip only when de-centered sampled-vertex motion is greater than 0.01.
 - Compute reference alignment, camera bounds, validity, and renders independently
   for every clip.
+- Fit the fixed clip camera using Blender's effective square-frame projection,
+  with five percent safety margin per limiting image edge.
 - For rigged assets, align REST-pose root scale to the first animation frame and
   align its complete 3D orientation to the nearest of the 24 right-handed,
   axis-aligned 90-degree canonical rotations of that first frame.
