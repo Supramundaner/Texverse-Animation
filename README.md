@@ -14,7 +14,8 @@ renders, cameras, and manifests.
 - Compute reference alignment, camera bounds, validity, and renders independently
   for every clip.
 - For rigged assets, align REST-pose root scale to the first animation frame and
-  align REST facing to the nearest 90-degree canonical yaw of that first frame.
+  align its complete 3D orientation to the nearest of the 24 right-handed,
+  axis-aligned 90-degree canonical rotations of that first frame.
 - For unrigged assets, restore the original imported reference frame before
   applying per-clip alignment.
 
@@ -22,7 +23,7 @@ renders, cameras, and manifests.
 
 - `export_texverse_animation.py`: Blender worker for one asset.
 - `process_texverse_animation.py`: resumable multi-process supervisor.
-- `pipeline_logic.py`: dependency-free clip and canonical-yaw rules.
+- `pipeline_logic.py`: dependency-free clip and canonical-orientation rules.
 - `run_texverse_animation_batch.sh`: default four-worker launcher.
 - `tests/`: unit tests that do not require Blender.
 

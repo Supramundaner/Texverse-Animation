@@ -25,10 +25,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from pipeline_logic import PIPELINE_VERSION, snap_yaw_to_quarter_turn, split_clips, wrap_angle
+from pipeline_logic import PIPELINE_VERSION, snap_rotation_to_axis_aligned, split_clips
 
 
 NORMALIZED_MAX_EXTENT = 2.0
+
+
+def matrix_to_list(matrix: Matrix) -> list[list[float]]:
+    return [[float(value) for value in row] for row in matrix]
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,34 +194,23 @@ def root_joint_pose_matrix(scene, armature_name: str, bone_name: str) -> Matrix:
     return armature.matrix_world @ pose_bone.matrix
 
 
-def root_forward_yaw(matrix: Matrix) -> tuple[Vector, float | None]:
-    """Return the established root +Z forward vector and its horizontal yaw."""
-    forward = matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))
-    horizontal = Vector((forward.x, forward.y))
-    if horizontal.length < 1e-6:
-        return forward, None
-    horizontal.normalize()
-    return forward, math.atan2(horizontal.y, horizontal.x)
-
-
 def canonical_reference_transform(
     scene,
     meshes: list,
     reference_vertices: np.ndarray,
     target_centroid: np.ndarray,
 ) -> tuple[Matrix, dict]:
-    """Align REST orientation to the nearest 90-degree yaw of the first pose."""
+    """Align REST to the nearest 3D axis-aligned rotation of the first pose."""
     rest_matrix, root_metadata = root_joint_alignment(scene, meshes)
     reference_centroid = reference_vertices.mean(axis=0)
     scale_factor = 1.0
-    rest_forward = first_target_forward = None
-    rest_yaw = first_target_yaw = canonical_target_yaw = None
-    canonical_quarter_turn = None
+    rest_rotation = first_target_rotation = canonical_target_rotation = None
+    canonical_rotation_index = None
+    canonical_target_axes = None
 
     if root_metadata.get("applied") is False:
         rotation = Matrix.Identity(4)
-        method = "translation_only_no_armature_forward_axis"
-        yaw = 0.0
+        method = "translation_only_no_armature"
         pose_matrix = None
     else:
         pose_matrix = root_joint_pose_matrix(scene, root_metadata["armature"], root_metadata["bone"])
@@ -227,17 +220,14 @@ def canonical_reference_transform(
         # Use the root's uniform scale, or its geometric-average equivalent for noisy FBX matrices.
         scale_factor = float(np.exp(np.log(np.maximum(ratios, 1e-8)).mean()))
 
-        rest_forward, rest_yaw = root_forward_yaw(rest_matrix)
-        first_target_forward, first_target_yaw = root_forward_yaw(pose_matrix)
-        if rest_yaw is None or first_target_yaw is None:
-            rotation = Matrix.Identity(4)
-            method = "translation_and_scale_only_degenerate_root_forward_axis"
-            yaw = 0.0
-        else:
-            canonical_target_yaw, canonical_quarter_turn = snap_yaw_to_quarter_turn(first_target_yaw)
-            yaw = wrap_angle(canonical_target_yaw - rest_yaw)
-            rotation = Matrix.Rotation(yaw, 4, "Z")
-            method = "yaw_align_rest_root_to_nearest_quarter_turn_of_first_target_root_then_match_centroid"
+        rest_rotation = rest_matrix.to_quaternion().to_matrix()
+        first_target_rotation = pose_matrix.to_quaternion().to_matrix()
+        snapped, canonical_rotation_index, canonical_target_axes = snap_rotation_to_axis_aligned(
+            first_target_rotation
+        )
+        canonical_target_rotation = Matrix(snapped)
+        rotation = (canonical_target_rotation @ rest_rotation.inverted()).to_4x4()
+        method = "align_rest_root_to_nearest_3d_axis_rotation_of_first_target_root_then_match_centroid"
 
     transform = (
         Matrix.Translation(Vector(target_centroid))
@@ -249,15 +239,16 @@ def canonical_reference_transform(
         "applied": True,
         "method": method,
         "root": root_metadata,
-        "rest_root_forward_world": list(rest_forward) if rest_forward is not None else None,
-        "rest_root_yaw_radians": rest_yaw,
-        "first_target_root_forward_world": (
-            list(first_target_forward) if first_target_forward is not None else None
+        "rest_root_rotation": matrix_to_list(rest_rotation) if rest_rotation is not None else None,
+        "first_target_root_rotation": (
+            matrix_to_list(first_target_rotation) if first_target_rotation is not None else None
         ),
-        "first_target_root_yaw_radians": first_target_yaw,
-        "canonical_target_yaw_radians": canonical_target_yaw,
-        "canonical_target_quarter_turn": canonical_quarter_turn,
-        "yaw_radians": float(yaw),
+        "canonical_target_rotation": (
+            matrix_to_list(canonical_target_rotation) if canonical_target_rotation is not None else None
+        ),
+        "canonical_target_axes": list(canonical_target_axes) if canonical_target_axes is not None else None,
+        "canonical_rotation_index": canonical_rotation_index,
+        "applied_rotation": matrix_to_list(rotation),
         "reference_uniform_scale": scale_factor,
         "root_rest_scale": [float(value) for value in rest_matrix.to_scale()],
         "root_first_target_scale": (

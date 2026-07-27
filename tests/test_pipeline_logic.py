@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from pipeline_logic import snap_yaw_to_quarter_turn, split_clips, wrap_angle
+from pipeline_logic import CANONICAL_AXIS_ROTATIONS, snap_rotation_to_axis_aligned, split_clips
 
 
 class SplitClipsTests(unittest.TestCase):
@@ -24,23 +24,39 @@ class SplitClipsTests(unittest.TestCase):
         self.assertEqual(metadata["selected_frame_count"], 96)
 
 
-class CanonicalYawTests(unittest.TestCase):
-    def test_snaps_to_nearest_quarter_turn(self) -> None:
-        cases = [
-            (math.radians(10), 0.0, 0),
-            (math.radians(50), math.pi / 2.0, 1),
-            (math.radians(140), -math.pi, 2),
-            (math.radians(-80), -math.pi / 2.0, 3),
-        ]
-        for angle, expected, expected_index in cases:
-            with self.subTest(angle=angle):
-                snapped, index = snap_yaw_to_quarter_turn(angle)
-                self.assertAlmostEqual(snapped, expected)
-                self.assertEqual(index, expected_index)
+class CanonicalRotationTests(unittest.TestCase):
+    def test_has_24_unique_right_handed_rotations(self) -> None:
+        matrices = [matrix for matrix, _ in CANONICAL_AXIS_ROTATIONS]
 
-    def test_wrapping_is_stable(self) -> None:
-        self.assertAlmostEqual(wrap_angle(2.0 * math.pi), 0.0)
-        self.assertAlmostEqual(wrap_angle(3.0 * math.pi), -math.pi)
+        self.assertEqual(len(matrices), 24)
+        self.assertEqual(len(set(matrices)), 24)
+
+    def test_snaps_pitch_to_axis_aligned_rotation(self) -> None:
+        # Rotation about Y by roughly 86 degrees: local +Z becomes world +X.
+        angle = math.radians(86)
+        rotation = (
+            (math.cos(angle), 0.0, math.sin(angle)),
+            (0.0, 1.0, 0.0),
+            (-math.sin(angle), 0.0, math.cos(angle)),
+        )
+
+        snapped, _, axes = snap_rotation_to_axis_aligned(rotation)
+
+        self.assertEqual(axes, ("-Z", "+Y", "+X"))
+        self.assertEqual(snapped, ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0)))
+
+    def test_snaps_combined_3d_rotation(self) -> None:
+        expected, expected_axes = CANONICAL_AXIS_ROTATIONS[7]
+        noisy = tuple(
+            tuple(value + (0.02 if row == column else -0.01) for column, value in enumerate(row_values))
+            for row, row_values in enumerate(expected)
+        )
+
+        snapped, index, axes = snap_rotation_to_axis_aligned(noisy)
+
+        self.assertEqual(index, 7)
+        self.assertEqual(snapped, expected)
+        self.assertEqual(axes, expected_axes)
 
 
 if __name__ == "__main__":
