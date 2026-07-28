@@ -14,4 +14,6 @@ exec python "$SCRIPT_DIR/process_texverse_animation.py" \
   --max-clips 6 \
   --max-fps 16 \
   --min-motion 0.01 \
+  --min-image-change 0.001 \
+  --image-change-pixel-threshold 10 \
   --render-threads 12

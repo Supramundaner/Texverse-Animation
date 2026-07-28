@@ -75,6 +75,8 @@ def processing_config(args: argparse.Namespace) -> dict:
         "max_clips": args.max_clips,
         "max_fps": args.max_fps,
         "min_motion": args.min_motion,
+        "min_image_change": args.min_image_change,
+        "image_change_pixel_threshold": args.image_change_pixel_threshold,
         "render_threads": args.render_threads,
     }
 
@@ -182,6 +184,10 @@ def process_record(record: dict, args: argparse.Namespace, gpu_id: str | None) -
             str(args.max_fps),
             "--min-motion",
             str(args.min_motion),
+            "--min-image-change",
+            str(args.min_image_change),
+            "--image-change-pixel-threshold",
+            str(args.image_change_pixel_threshold),
             "--render-threads",
             str(args.render_threads),
         ]
@@ -284,6 +290,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-clips", type=int, default=6)
     parser.add_argument("--max-fps", type=float, default=16.0)
     parser.add_argument("--min-motion", type=float, default=0.01)
+    parser.add_argument("--min-image-change", type=float, default=0.001)
+    parser.add_argument("--image-change-pixel-threshold", type=int, default=10)
     parser.add_argument("--render-threads", type=int, default=12)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--force", action="store_true")

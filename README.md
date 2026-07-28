@@ -11,6 +11,8 @@ renders, cameras, and manifests.
 - Select at most one deterministic contiguous 96-frame window.
 - Split the selected window into at most six clips of at most 16 frames.
 - Keep a clip only when de-centered sampled-vertex motion is greater than 0.01.
+- After rendering, keep a clip only when consecutive target frames change at
+  least 0.1% of pixels on average, using a maximum RGB-channel delta of 10/255.
 - Compute reference alignment, camera bounds, validity, and renders independently
   for every clip.
 - Fit the fixed clip camera using Blender's effective square-frame projection,

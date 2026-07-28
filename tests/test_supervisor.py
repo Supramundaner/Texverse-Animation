@@ -32,6 +32,8 @@ class ProcessingConfigTests(unittest.TestCase):
             max_clips=6,
             max_fps=16.0,
             min_motion=0.01,
+            min_image_change=0.001,
+            image_change_pixel_threshold=10,
             render_threads=12,
         )
 
@@ -41,6 +43,8 @@ class ProcessingConfigTests(unittest.TestCase):
             "max_clips",
             "max_fps",
             "min_motion",
+            "min_image_change",
+            "image_change_pixel_threshold",
             "render_threads",
         })
 

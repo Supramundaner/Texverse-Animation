@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-clips", type=int, default=6)
     parser.add_argument("--max-fps", type=float, default=16.0)
     parser.add_argument("--min-motion", type=float, default=0.01)
+    parser.add_argument("--min-image-change", type=float, default=0.001)
+    parser.add_argument("--image-change-pixel-threshold", type=int, default=10)
     parser.add_argument("--render-threads", type=int, default=12)
     return parser.parse_args(argv)
 
@@ -589,6 +591,49 @@ def build_frame_camera(vertices: np.ndarray, target_camera: dict, view_direction
     }
 
 
+def load_rendered_rgb8(path: Path) -> np.ndarray:
+    """Load an output PNG through Blender as its encoded 8-bit RGB values."""
+    image = bpy.data.images.load(str(path), check_existing=False)
+    try:
+        width, height = image.size
+        rgba = np.empty(width * height * 4, dtype=np.float32)
+        image.pixels.foreach_get(rgba)
+        rgb = rgba.reshape((height, width, 4))[..., :3]
+        return np.rint(np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    finally:
+        bpy.data.images.remove(image)
+
+
+def measure_image_change(image_paths: list[Path], pixel_threshold: int) -> dict:
+    """Measure visible change as changed-pixel fractions between rendered frames."""
+    changed_fractions = []
+    mean_absolute_rgb_differences = []
+    previous = None
+    for path in image_paths:
+        current = load_rendered_rgb8(path)
+        if previous is not None:
+            difference = np.abs(current.astype(np.int16) - previous.astype(np.int16))
+            changed_fractions.append(float(np.mean(difference.max(axis=2) > pixel_threshold)))
+            mean_absolute_rgb_differences.append(float(difference.mean()))
+        previous = current
+    return {
+        "method": "mean_fraction_of_pixels_whose_max_rgb_channel_delta_exceeds_threshold",
+        "comparison": "consecutive_rendered_target_frames",
+        "pixel_space": "encoded_8bit_rgb_output_png",
+        "pixel_difference_threshold": pixel_threshold,
+        "step_count": len(changed_fractions),
+        "mean_changed_pixel_fraction_per_frame": (
+            float(np.mean(changed_fractions)) if changed_fractions else 0.0
+        ),
+        "max_changed_pixel_fraction": max(changed_fractions, default=0.0),
+        "step_changed_pixel_fractions": changed_fractions,
+        "mean_absolute_rgb_difference_per_frame": (
+            float(np.mean(mean_absolute_rgb_differences)) if mean_absolute_rgb_differences else 0.0
+        ),
+        "step_mean_absolute_rgb_differences": mean_absolute_rgb_differences,
+    }
+
+
 def build_sample_row(
     args,
     clip_index: int,
@@ -676,6 +721,8 @@ def build_clip_manifest(
     frames: list[int],
     motion: dict,
     min_motion: float,
+    image_change: dict,
+    min_image_change: float,
     aligned_reference: np.ndarray,
     faces: np.ndarray,
     final_root: Path,
@@ -693,6 +740,11 @@ def build_clip_manifest(
         "exported_source_frames": frames,
         "motion": motion,
         "motion_filter": {"min_motion": min_motion, "passed": True},
+        "image_change": image_change,
+        "image_change_filter": {
+            "min_mean_changed_pixel_fraction_per_frame": min_image_change,
+            "passed": True,
+        },
         "vertex_count": int(len(aligned_reference)),
         "face_count": int(len(faces)),
         "reference_mesh": str(final_root / "reference_mesh.npz"),
@@ -771,7 +823,7 @@ def export_clip(
         set_armature_pose_position(scene, "POSE")
 
     reference_centroid = aligned_reference.mean(axis=0).astype(float).tolist()
-    rows, frame_metadata = [], []
+    rows, frame_metadata, image_paths = [], [], []
     for index, (source_frame, vertices) in enumerate(zip(frames, animation_vertices)):
         scene.frame_set(source_frame)
         bpy.context.view_layer.update()
@@ -780,6 +832,7 @@ def export_clip(
         camera_data = build_frame_camera(vertices, target_camera_metadata, view_direction)
         scene.render.filepath = str(images_dir / image_file)
         bpy.ops.render.render(write_still=True)
+        image_paths.append(images_dir / image_file)
         frame_metadata.append({"frame_index": index, "source_frame": source_frame, **camera_data})
         rows.append(build_sample_row(
             args=args,
@@ -794,12 +847,33 @@ def export_clip(
             image_file=image_file,
         ))
 
+    image_change = measure_image_change(image_paths, args.image_change_pixel_threshold)
+    if image_change["mean_changed_pixel_fraction_per_frame"] <= args.min_image_change:
+        shutil.rmtree(staging)
+        return {
+            "status": "skipped_low_image_change",
+            "clip_index": clip_index,
+            "frames": len(frames),
+            "motion": motion,
+            "image_change": image_change,
+            "image_change_filter": {
+                "min_mean_changed_pixel_fraction_per_frame": args.min_image_change,
+                "passed": False,
+            },
+        }
+    for row in rows:
+        row["clip_mean_changed_pixel_fraction_per_frame"] = image_change[
+            "mean_changed_pixel_fraction_per_frame"
+        ]
+
     source_manifest = build_clip_manifest(
         common=common,
         clip_index=clip_index,
         frames=frames,
         motion=motion,
         min_motion=args.min_motion,
+        image_change=image_change,
+        min_image_change=args.min_image_change,
         aligned_reference=aligned_reference,
         faces=faces,
         final_root=final_root,
@@ -832,12 +906,17 @@ def export_clip(
         "clip_index": clip_index,
         "frames": len(frames),
         "motion": motion,
+        "image_change": image_change,
         "output": str(final_root),
     }
 
 
 def main() -> None:
     args = parse_args()
+    if not 0.0 <= args.min_image_change <= 1.0:
+        raise ValueError("--min-image-change must be between 0 and 1")
+    if not 0 <= args.image_change_pixel_threshold <= 255:
+        raise ValueError("--image-change-pixel-threshold must be between 0 and 255")
     imported_scene(args.source)
     scene = bpy.context.scene
     reference_source_frame = int(scene.frame_current)
