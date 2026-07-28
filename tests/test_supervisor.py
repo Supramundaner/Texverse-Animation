@@ -34,6 +34,8 @@ class ProcessingConfigTests(unittest.TestCase):
             min_motion=0.01,
             min_image_change=0.001,
             image_change_pixel_threshold=10,
+            min_reference_foreground=0.05,
+            reference_background_pixel_threshold=10,
             render_threads=12,
         )
 
@@ -45,6 +47,8 @@ class ProcessingConfigTests(unittest.TestCase):
             "min_motion",
             "min_image_change",
             "image_change_pixel_threshold",
+            "min_reference_foreground",
+            "reference_background_pixel_threshold",
             "render_threads",
         })
 

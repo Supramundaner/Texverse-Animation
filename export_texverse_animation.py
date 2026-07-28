@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-motion", type=float, default=0.01)
     parser.add_argument("--min-image-change", type=float, default=0.001)
     parser.add_argument("--image-change-pixel-threshold", type=int, default=10)
+    parser.add_argument("--min-reference-foreground", type=float, default=0.05)
+    parser.add_argument("--reference-background-pixel-threshold", type=int, default=10)
     parser.add_argument("--render-threads", type=int, default=12)
     return parser.parse_args(argv)
 
@@ -634,6 +636,22 @@ def measure_image_change(image_paths: list[Path], pixel_threshold: int) -> dict:
     }
 
 
+def measure_reference_foreground(image_path: Path, pixel_threshold: int) -> dict:
+    """Estimate reference foreground from its difference to the border background."""
+    rgb = load_rendered_rgb8(image_path).astype(np.int16)
+    border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]), axis=0)
+    background = np.median(border, axis=0)
+    difference = np.abs(rgb - background)
+    foreground_fraction = float(np.mean(difference.max(axis=2) > pixel_threshold))
+    return {
+        "method": "fraction_of_pixels_different_from_median_border_background",
+        "pixel_space": "encoded_8bit_rgb_output_png",
+        "pixel_difference_threshold": pixel_threshold,
+        "estimated_background_rgb": background.astype(float).tolist(),
+        "foreground_pixel_fraction": foreground_fraction,
+    }
+
+
 def build_sample_row(
     args,
     clip_index: int,
@@ -723,6 +741,8 @@ def build_clip_manifest(
     min_motion: float,
     image_change: dict,
     min_image_change: float,
+    reference_foreground: dict,
+    min_reference_foreground: float,
     aligned_reference: np.ndarray,
     faces: np.ndarray,
     final_root: Path,
@@ -743,6 +763,11 @@ def build_clip_manifest(
         "image_change": image_change,
         "image_change_filter": {
             "min_mean_changed_pixel_fraction_per_frame": min_image_change,
+            "passed": True,
+        },
+        "reference_foreground": reference_foreground,
+        "reference_foreground_filter": {
+            "min_foreground_pixel_fraction": min_reference_foreground,
             "passed": True,
         },
         "vertex_count": int(len(aligned_reference)),
@@ -822,6 +847,23 @@ def export_clip(
             restore_reference_transform(originals)
         set_armature_pose_position(scene, "POSE")
 
+    reference_foreground = measure_reference_foreground(
+        reference_dir / "front.png", args.reference_background_pixel_threshold
+    )
+    if reference_foreground["foreground_pixel_fraction"] <= args.min_reference_foreground:
+        shutil.rmtree(staging)
+        return {
+            "status": "skipped_low_reference_foreground",
+            "clip_index": clip_index,
+            "frames": len(frames),
+            "motion": motion,
+            "reference_foreground": reference_foreground,
+            "reference_foreground_filter": {
+                "min_foreground_pixel_fraction": args.min_reference_foreground,
+                "passed": False,
+            },
+        }
+
     reference_centroid = aligned_reference.mean(axis=0).astype(float).tolist()
     rows, frame_metadata, image_paths = [], [], []
     for index, (source_frame, vertices) in enumerate(zip(frames, animation_vertices)):
@@ -865,6 +907,9 @@ def export_clip(
         row["clip_mean_changed_pixel_fraction_per_frame"] = image_change[
             "mean_changed_pixel_fraction_per_frame"
         ]
+        row["reference_foreground_pixel_fraction"] = reference_foreground[
+            "foreground_pixel_fraction"
+        ]
 
     source_manifest = build_clip_manifest(
         common=common,
@@ -874,6 +919,8 @@ def export_clip(
         min_motion=args.min_motion,
         image_change=image_change,
         min_image_change=args.min_image_change,
+        reference_foreground=reference_foreground,
+        min_reference_foreground=args.min_reference_foreground,
         aligned_reference=aligned_reference,
         faces=faces,
         final_root=final_root,
@@ -907,6 +954,7 @@ def export_clip(
         "frames": len(frames),
         "motion": motion,
         "image_change": image_change,
+        "reference_foreground": reference_foreground,
         "output": str(final_root),
     }
 
@@ -917,6 +965,10 @@ def main() -> None:
         raise ValueError("--min-image-change must be between 0 and 1")
     if not 0 <= args.image_change_pixel_threshold <= 255:
         raise ValueError("--image-change-pixel-threshold must be between 0 and 255")
+    if not 0.0 <= args.min_reference_foreground <= 1.0:
+        raise ValueError("--min-reference-foreground must be between 0 and 1")
+    if not 0 <= args.reference_background_pixel_threshold <= 255:
+        raise ValueError("--reference-background-pixel-threshold must be between 0 and 255")
     imported_scene(args.source)
     scene = bpy.context.scene
     reference_source_frame = int(scene.frame_current)

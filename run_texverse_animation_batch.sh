@@ -16,4 +16,6 @@ exec python "$SCRIPT_DIR/process_texverse_animation.py" \
   --min-motion 0.01 \
   --min-image-change 0.001 \
   --image-change-pixel-threshold 10 \
+  --min-reference-foreground 0.05 \
+  --reference-background-pixel-threshold 10 \
   --render-threads 12

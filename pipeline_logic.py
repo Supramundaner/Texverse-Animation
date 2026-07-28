@@ -8,7 +8,7 @@ from itertools import permutations, product
 from typing import Sequence
 
 
-PIPELINE_VERSION = "texverse-animation-v19"
+PIPELINE_VERSION = "texverse-animation-v20"
 
 
 def _permutation_sign(permutation: tuple[int, int, int]) -> int:
