@@ -14,17 +14,20 @@ renders, cameras, and manifests.
   reference mesh bounding box's largest edge, is greater than 0.01.
 - Keep a clip only when its maximum centroid excursion from the first target
   frame does not exceed one reference-pose bounding-box edge.
-- After rendering, keep a clip only when consecutive target frames change at
+- After rendering, keep a clip only when consecutive `camera_0` target frames change at
   least 1.0% of pixels on average, using a maximum RGB-channel delta of 10/255.
 - Before rendering target frames, keep a clip only when at least 5% of its
   reference pixels differ from the median border background by more than 10/255.
+- Render target images from `camera_0` (front, negative Y) and one deterministic
+  extra view sampled from `camera_1` through `camera_11`; the twelve camera
+  positions are spaced every 30 degrees around world Z.
 - Compute reference alignment, camera bounds, validity, and renders independently
   for every clip.
 - Fit the fixed clip camera using Blender's effective square-frame projection,
   with five percent safety margin per limiting image edge.
 - For rigged assets, align REST-pose root scale to the first animation frame and
-  align its complete 3D orientation to the nearest of the 24 right-handed,
-  axis-aligned 90-degree canonical rotations of that first frame.
+  align its horizontal (world-Z) facing direction to the nearest 90-degree
+  canonical yaw of that first frame. Pitch and roll are preserved.
 - For unrigged assets, restore the original imported reference frame before
   applying per-clip alignment.
 
@@ -32,9 +35,14 @@ renders, cameras, and manifests.
 
 - `export_texverse_animation.py`: Blender worker for one asset.
 - `process_texverse_animation.py`: resumable multi-process supervisor.
-- `pipeline_logic.py`: dependency-free clip and canonical-orientation rules.
+- `pipeline_logic.py`: dependency-free clip and canonical-yaw rules.
 - `run_texverse_animation_batch.sh`: default four-worker launcher.
 - `tests/`: unit tests that do not require Blender.
+
+Rigged clips also contain a `skeleton/` directory with per-frame global joint
+matrices and `metadata.json` describing joint names and parent indices. Target
+images are stored below `target_images/camera_0/` and the sampled extra camera
+directory; target vertices remain shared below `target_vertices/`.
 
 ## Requirements
 
@@ -42,6 +50,8 @@ renders, cameras, and manifests.
 - Blender 3.5.x with NumPy available to Blender Python.
 - A dataset root containing `animation/inventory.json` and the source archives
   referenced by that inventory.
+- For a flat directory of animated FBX/GLB assets, the supervisor also accepts
+  `--source-dir` and reads the files directly without creating per-asset zip archives.
 
 ## Tests
 

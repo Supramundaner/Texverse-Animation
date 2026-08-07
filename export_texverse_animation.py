@@ -28,8 +28,10 @@ if str(SCRIPT_DIR) not in sys.path:
 from pipeline_logic import (
     PIPELINE_VERSION,
     reference_bbox_normalization_scale,
-    snap_rotation_to_axis_aligned,
+    sampled_orbit_camera_indices,
+    snap_yaw_to_quarter_turn,
     split_clips,
+    wrap_angle,
 )
 
 
@@ -178,6 +180,51 @@ def set_armature_pose_position(scene, position: str) -> list[str]:
     return sorted(armature.name for armature in armatures)
 
 
+def skeleton_descriptor(scene, meshes: list) -> dict | None:
+    """Describe one deterministic mesh-bound armature for per-frame export."""
+    armatures = [obj for obj in scene.objects if obj.type == "ARMATURE"]
+    bound_armatures = [
+        armature for armature in armatures
+        if any(has_armature_binding(mesh, {armature}) for mesh in meshes)
+    ]
+    candidates = sorted(bound_armatures, key=lambda obj: obj.name)
+    if not candidates:
+        return None
+    armature = candidates[0]
+    bones = sorted(armature.data.bones, key=lambda bone: bone.name)
+    if not bones:
+        return None
+    bone_indices = {bone.name: index for index, bone in enumerate(bones)}
+    return {
+        "armature": armature.name,
+        "space": "normalized_blender_world",
+        "format": "per_frame_global_joint_matrices",
+        "rest_matrix_space": "armature_local",
+        "joint_count": len(bones),
+        "joints": [
+            {
+                "name": bone.name,
+                "parent_index": bone_indices.get(bone.parent.name) if bone.parent else -1,
+                "rest_matrix_local": matrix_to_list(bone.matrix_local),
+            }
+            for bone in bones
+        ],
+    }
+
+
+def evaluated_skeleton_matrices(scene, descriptor: dict) -> np.ndarray:
+    """Read global normalized-world pose matrices in descriptor joint order."""
+    armature = scene.objects[descriptor["armature"]]
+    matrices = []
+    for joint in descriptor["joints"]:
+        pose_bone = armature.pose.bones[joint["name"]]
+        matrices.append(np.asarray(armature.matrix_world @ pose_bone.matrix, dtype=np.float32))
+    values = np.asarray(matrices, dtype=np.float32)
+    if not np.isfinite(values).all():
+        raise RuntimeError(f"Non-finite skeleton transform in armature {armature.name}")
+    return values
+
+
 def root_joint_alignment(scene, meshes: list) -> tuple[Matrix, dict]:
     """Build the rigid REST-to-first-POSE transform for one deterministic root bone."""
     armatures = [obj for obj in scene.objects if obj.type == "ARMATURE"]
@@ -204,23 +251,34 @@ def root_joint_pose_matrix(scene, armature_name: str, bone_name: str) -> Matrix:
     return armature.matrix_world @ pose_bone.matrix
 
 
+def root_forward_yaw(matrix: Matrix) -> tuple[Vector, float | None]:
+    """Return the root +Z forward vector and its horizontal world yaw."""
+    forward = matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))
+    horizontal = Vector((forward.x, forward.y))
+    if horizontal.length < 1e-6:
+        return forward, None
+    horizontal.normalize()
+    return forward, math.atan2(horizontal.y, horizontal.x)
+
+
 def canonical_reference_transform(
     scene,
     meshes: list,
     reference_vertices: np.ndarray,
     target_centroid: np.ndarray,
 ) -> tuple[Matrix, dict]:
-    """Align REST to the nearest 3D axis-aligned rotation of the first pose."""
+    """Align REST to the nearest 90-degree world-Z yaw of the first pose."""
     rest_matrix, root_metadata = root_joint_alignment(scene, meshes)
     reference_centroid = reference_vertices.mean(axis=0)
     scale_factor = 1.0
-    rest_rotation = first_target_rotation = canonical_target_rotation = None
-    canonical_rotation_index = None
-    canonical_target_axes = None
+    rest_forward = first_target_forward = None
+    rest_yaw = first_target_yaw = canonical_target_yaw = None
+    canonical_quarter_turn = None
 
     if root_metadata.get("applied") is False:
         rotation = Matrix.Identity(4)
-        method = "translation_only_no_armature"
+        method = "translation_only_no_armature_forward_axis"
+        yaw = 0.0
         pose_matrix = None
     else:
         pose_matrix = root_joint_pose_matrix(scene, root_metadata["armature"], root_metadata["bone"])
@@ -230,14 +288,17 @@ def canonical_reference_transform(
         # Use the root's uniform scale, or its geometric-average equivalent for noisy FBX matrices.
         scale_factor = float(np.exp(np.log(np.maximum(ratios, 1e-8)).mean()))
 
-        rest_rotation = rest_matrix.to_quaternion().to_matrix()
-        first_target_rotation = pose_matrix.to_quaternion().to_matrix()
-        snapped, canonical_rotation_index, canonical_target_axes = snap_rotation_to_axis_aligned(
-            first_target_rotation
-        )
-        canonical_target_rotation = Matrix(snapped)
-        rotation = (canonical_target_rotation @ rest_rotation.inverted()).to_4x4()
-        method = "align_rest_root_to_nearest_3d_axis_rotation_of_first_target_root_then_match_centroid"
+        rest_forward, rest_yaw = root_forward_yaw(rest_matrix)
+        first_target_forward, first_target_yaw = root_forward_yaw(pose_matrix)
+        if rest_yaw is None or first_target_yaw is None:
+            rotation = Matrix.Identity(4)
+            method = "translation_and_scale_only_degenerate_root_forward_axis"
+            yaw = 0.0
+        else:
+            canonical_target_yaw, canonical_quarter_turn = snap_yaw_to_quarter_turn(first_target_yaw)
+            yaw = wrap_angle(canonical_target_yaw - rest_yaw)
+            rotation = Matrix.Rotation(yaw, 4, "Z")
+            method = "yaw_align_rest_root_to_nearest_quarter_turn_of_first_target_root_then_match_centroid"
 
     transform = (
         Matrix.Translation(Vector(target_centroid))
@@ -249,16 +310,13 @@ def canonical_reference_transform(
         "applied": True,
         "method": method,
         "root": root_metadata,
-        "rest_root_rotation": matrix_to_list(rest_rotation) if rest_rotation is not None else None,
-        "first_target_root_rotation": (
-            matrix_to_list(first_target_rotation) if first_target_rotation is not None else None
-        ),
-        "canonical_target_rotation": (
-            matrix_to_list(canonical_target_rotation) if canonical_target_rotation is not None else None
-        ),
-        "canonical_target_axes": list(canonical_target_axes) if canonical_target_axes is not None else None,
-        "canonical_rotation_index": canonical_rotation_index,
-        "applied_rotation": matrix_to_list(rotation),
+        "rest_root_forward_world": list(rest_forward) if rest_forward is not None else None,
+        "rest_root_yaw_radians": rest_yaw,
+        "first_target_root_forward_world": list(first_target_forward) if first_target_forward is not None else None,
+        "first_target_root_yaw_radians": first_target_yaw,
+        "canonical_target_yaw_radians": canonical_target_yaw,
+        "canonical_target_quarter_turn": canonical_quarter_turn,
+        "yaw_radians": float(yaw),
         "reference_uniform_scale": scale_factor,
         "root_rest_scale": [float(value) for value in rest_matrix.to_scale()],
         "root_first_target_scale": (
@@ -482,13 +540,32 @@ def sampled_frames(scene, maximum_fps: float, frame_start: int, frame_end: int) 
     }
 
 
-FRONT_VIEW = {
-    "name": "front_negative_y",
-    "offset": np.asarray((0.0, -1.0, 0.0)),
-    "horizontal": 0,
-    "vertical": 2,
-    "depth": 1,
-}
+CAMERA_COUNT = 12
+
+
+def sampled_camera_indices(sample_id: str, clip_index: int) -> list[int]:
+    """Always include front camera_0 and deterministically sample one side view."""
+    return sampled_orbit_camera_indices(sample_id, clip_index, CAMERA_COUNT)
+
+
+def camera_view(camera_index: int) -> dict:
+    """Return one of twelve evenly spaced views around the world Z axis."""
+    if not 0 <= camera_index < CAMERA_COUNT:
+        raise ValueError(f"camera index must be between 0 and {CAMERA_COUNT - 1}")
+    angle_degrees = camera_index * 30.0
+    angle = math.radians(angle_degrees)
+    offset = np.asarray((math.sin(angle), -math.cos(angle), 0.0), dtype=np.float32)
+    right = np.asarray((math.cos(angle), math.sin(angle), 0.0), dtype=np.float32)
+    up = np.asarray((0.0, 0.0, 1.0), dtype=np.float32)
+    return {
+        "index": camera_index,
+        "name": f"camera_{camera_index}",
+        "angle_degrees": angle_degrees,
+        "offset": offset,
+        "right": right,
+        "up": up,
+        "depth": offset,
+    }
 
 
 def effective_camera_half_tangents(scene, camera_data) -> tuple[float, float]:
@@ -504,17 +581,19 @@ def camera_distance_for_bounds(
     camera_data,
     minimum: np.ndarray,
     maximum: np.ndarray,
-    view_direction: str,
+    view: dict,
 ) -> float:
     """Fit a perspective camera to projected bounds with five percent empty space per edge."""
     half_extent = 0.5 * (maximum - minimum)
-    view = FRONT_VIEW
     usable_half_image = 0.90  # Five percent empty space on each image edge.
     horizontal_tangent, vertical_tangent = effective_camera_half_tangents(scene, camera_data)
-    horizontal = half_extent[view["horizontal"]] / max(horizontal_tangent * usable_half_image, 1e-6)
-    vertical = half_extent[view["vertical"]] / max(vertical_tangent * usable_half_image, 1e-6)
+    horizontal_half_extent = float(np.dot(np.abs(view["right"]), half_extent))
+    vertical_half_extent = float(np.dot(np.abs(view["up"]), half_extent))
+    depth_half_extent = float(np.dot(np.abs(view["depth"]), half_extent))
+    horizontal = horizontal_half_extent / max(horizontal_tangent * usable_half_image, 1e-6)
+    vertical = vertical_half_extent / max(vertical_tangent * usable_half_image, 1e-6)
     # The nearest depth bound, rather than the mesh centre, controls perspective cropping.
-    return float(half_extent[view["depth"]] + max(horizontal, vertical, 0.001))
+    return float(depth_half_extent + max(horizontal, vertical, 0.001))
 
 
 def configure_render(scene, resolution: int, vertices: np.ndarray, render_threads: int):
@@ -532,15 +611,15 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
     camera["texverse_export_helper"] = True
     camera_data.type = "PERSP"
     camera_data.lens = 50.0
-    view_direction = FRONT_VIEW["name"]
-    distance = camera_distance_for_bounds(scene, camera_data, minimum, maximum, view_direction)
-    camera.location = tuple(center + FRONT_VIEW["offset"] * distance)
+    view = camera_view(0)
+    distance = camera_distance_for_bounds(scene, camera_data, minimum, maximum, view)
+    camera.location = tuple(center + view["offset"] * distance)
     camera.rotation_euler = (Vector(center) - camera.location).to_track_quat("-Z", "Y").to_euler()
     camera_data.clip_start = 0.001
     camera_data.clip_end = 100.0
     scene.camera = camera
     lights = []
-    for name, position, energy in (("Key", center + np.asarray((-2, -2, 3)), 1200.0), ("Fill", center + np.asarray((2, -1, 1)), 600.0)):
+    for name, energy in (("Key", 1200.0), ("Fill", 600.0)):
         light_data = bpy.data.lights.new(name, "AREA")
         light_data.energy = energy
         light_data.shape = "DISK"
@@ -548,9 +627,10 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
         light = bpy.data.objects.new(name, light_data)
         scene.collection.objects.link(light)
         light["texverse_export_helper"] = True
-        light.location = tuple(position)
+        role = "key" if name == "Key" else "fill"
+        light.location = tuple(center)
         light.rotation_euler = (Vector(center) - light.location).to_track_quat("-Z", "Y").to_euler()
-        lights.append((light, np.asarray((-2, -2, 3)) if name == "Key" else np.asarray((2, -1, 1))))
+        lights.append((light, role))
     scene.render.engine = "CYCLES"
     # CUDA and OptiX kernel initialization is not compatible with this Blender build on A800.
     scene.cycles.device = "CPU"
@@ -565,7 +645,7 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
     background = scene.world.node_tree.nodes.get("Background")
     background.inputs["Color"].default_value = (0.15, 0.15, 0.15, 1.0)
     background.inputs["Strength"].default_value = 0.35
-    return camera, lights, view_direction
+    return camera, lights
 
 
 def remove_export_render_helpers(scene) -> None:
@@ -575,17 +655,20 @@ def remove_export_render_helpers(scene) -> None:
             bpy.data.objects.remove(obj, do_unlink=True)
 
 
-def update_camera(scene, camera, lights: list, vertices: np.ndarray, view_direction: str) -> dict:
+def update_camera(scene, camera, lights: list, vertices: np.ndarray, view: dict) -> dict:
     minimum = vertices.min(axis=0)
     maximum = vertices.max(axis=0)
     center = 0.5 * (minimum + maximum)
-    distance = camera_distance_for_bounds(scene, camera.data, minimum, maximum, view_direction)
-    camera.location = tuple(center + FRONT_VIEW["offset"] * distance)
+    distance = camera_distance_for_bounds(scene, camera.data, minimum, maximum, view)
+    camera.location = tuple(center + view["offset"] * distance)
     camera.rotation_euler = (Vector(center) - camera.location).to_track_quat("-Z", "Y").to_euler()
     camera.data.clip_end = max(100.0, distance * 4.0)
     # Keep illumination relative to each independently framed mesh pose.
-    for light, offset in lights:
-        light.location = tuple(center + offset)
+    key_offset = -2.0 * view["right"] - 2.0 * view["offset"] + 3.0 * view["up"]
+    fill_offset = 2.0 * view["right"] - view["offset"] + view["up"]
+    offsets = {"key": key_offset, "fill": fill_offset}
+    for light, role in lights:
+        light.location = tuple(center + offsets[role])
         light.rotation_euler = (Vector(center) - light.location).to_track_quat("-Z", "Y").to_euler()
     bpy.context.view_layer.update()
     return {
@@ -595,7 +678,10 @@ def update_camera(scene, camera, lights: list, vertices: np.ndarray, view_direct
         "camera_location": list(camera.location),
         "camera_rotation_euler": list(camera.rotation_euler),
         "camera_lens_mm": float(camera.data.lens),
-        "view_direction": view_direction,
+        "view_direction": view["name"],
+        "camera_index": int(view["index"]),
+        "camera_name": view["name"],
+        "camera_angle_degrees": float(view["angle_degrees"]),
     }
 
 
@@ -615,13 +701,16 @@ def build_reference_camera(aligned_reference: np.ndarray, target_camera: dict) -
     }
 
 
-def build_frame_camera(vertices: np.ndarray, target_camera: dict, view_direction: str) -> dict:
+def build_frame_camera(vertices: np.ndarray, target_camera: dict) -> dict:
     return {
         **bounds_metadata(vertices),
         "camera_location": target_camera["camera_location"],
         "camera_rotation_euler": target_camera["camera_rotation_euler"],
         "camera_lens_mm": target_camera["camera_lens_mm"],
-        "view_direction": view_direction,
+        "view_direction": target_camera["view_direction"],
+        "camera_index": target_camera["camera_index"],
+        "camera_name": target_camera["camera_name"],
+        "camera_angle_degrees": target_camera["camera_angle_degrees"],
         "camera_mode": "fixed_from_clip_animation_union_bounds",
     }
 
@@ -696,6 +785,9 @@ def build_sample_row(
     motion: dict,
     vertex_file: str,
     image_file: str,
+    camera_index: int,
+    camera_name: str,
+    skeleton_file: str | None,
 ) -> dict:
     return {
         "sample_id": args.sample_id,
@@ -703,12 +795,17 @@ def build_sample_row(
         "split": "train",
         "frame_index": frame_index,
         "source_frame": source_frame,
-        "view_label": "front",
+        "view_label": camera_name,
+        "camera_index": camera_index,
+        "camera_name": camera_name,
         "sample_root": str(final_root),
         "source_manifest": str(final_root / "source_manifest.json"),
         "rest_mesh": str(final_root / "reference_mesh.npz"),
         "target_vertices": str(final_root / "target_vertices" / vertex_file),
-        "target_image": str(final_root / "target_images" / image_file),
+        "target_image": str(final_root / "target_images" / camera_name / image_file),
+        "skeleton_motion": (
+            str(final_root / "skeleton" / skeleton_file) if skeleton_file else None
+        ),
         "reference_centroid": reference_centroid,
         "frame_centroid": frame_centroid,
         "clip_mean_motion_per_point_per_frame": motion["mean_per_point_per_frame"],
@@ -728,6 +825,7 @@ def build_common_metadata(
     armatures: list[str],
     reference_source_frame: int,
     normalization: dict,
+    skeleton: dict | None,
 ) -> dict:
     return {
         "pipeline_version": PIPELINE_VERSION,
@@ -753,6 +851,8 @@ def build_common_metadata(
             "camera": "perspective",
             "reference_camera_mode": "shared_with_clip_animation_union_bounds",
             "target_camera_mode": "fixed_from_clip_animation_union_bounds",
+            "target_camera_count": CAMERA_COUNT,
+            "target_camera_sampling": "camera_0_plus_one_deterministic_view_from_camera_1_to_camera_11",
             "forced_opaque_material_count": forced_opaque_materials,
         },
         "mesh_filter": mesh_filter,
@@ -763,6 +863,7 @@ def build_common_metadata(
             "source_frame": reference_source_frame,
         },
         "normalization": normalization,
+        "skeleton": skeleton,
     }
 
 
@@ -784,7 +885,11 @@ def build_clip_manifest(
     bounds_max: np.ndarray,
     reference_camera: dict,
     target_camera: dict,
+    target_cameras: dict[str, dict],
+    sampled_camera_indices: list[int],
     frame_metadata: list[dict],
+    frame_metadata_by_camera: dict[str, list[dict]],
+    image_change_by_camera: dict[str, dict],
 ) -> dict:
     return {
         **common,
@@ -814,7 +919,7 @@ def build_clip_manifest(
         "vertex_count": int(len(aligned_reference)),
         "face_count": int(len(faces)),
         "reference_mesh": str(final_root / "reference_mesh.npz"),
-        "reference_image": str(final_root / "reference_views" / "front.png"),
+        "reference_image": str(final_root / "reference_views" / "camera_0.png"),
         "reference_centroid": aligned_reference.mean(axis=0).astype(float).tolist(),
         "reference_alignment": reference_alignment,
         "animation_union_bounds": {
@@ -823,7 +928,14 @@ def build_clip_manifest(
         },
         "reference_camera": reference_camera,
         "target_camera": target_camera,
+        "target_cameras": target_cameras,
+        "sampled_camera_indices": sampled_camera_indices,
         "frames": frame_metadata,
+        "frames_by_camera": frame_metadata_by_camera,
+        "image_change_by_camera": image_change_by_camera,
+        "skeleton_motion": (
+            str(final_root / "skeleton") if common.get("skeleton") else None
+        ),
     }
 
 
@@ -835,6 +947,8 @@ def export_clip(
     remove_export_render_helpers(scene)
     set_armature_pose_position(scene, "POSE")
     animation_vertices = []
+    animation_skeleton = []
+    skeleton = common.get("skeleton")
     for source_frame in frames:
         scene.frame_set(source_frame)
         bpy.context.view_layer.update()
@@ -842,6 +956,8 @@ def export_clip(
         if current_topology != topology or not np.array_equal(frame_faces, faces):
             raise RuntimeError(f"Topology changed in clip {clip_index} at frame {source_frame}")
         animation_vertices.append(vertices)
+        if skeleton:
+            animation_skeleton.append(evaluated_skeleton_matrices(scene, skeleton))
     first_vertices = animation_vertices[0]
     # Reference scale/alignment is clip-specific and must be known before
     # motion is normalized. Derive the bbox from the final exported reference,
@@ -898,15 +1014,38 @@ def export_clip(
     bounds_min = np.min([vertices.min(axis=0) for vertices in animation_vertices], axis=0)
     bounds_max = np.max([vertices.max(axis=0) for vertices in animation_vertices], axis=0)
     bounds_vertices = np.stack((bounds_min, bounds_max))
-    target_camera, target_lights, view_direction = configure_render(scene, args.resolution, bounds_vertices, args.render_threads)
-    target_camera_metadata = update_camera(scene, target_camera, target_lights, bounds_vertices, view_direction)
+    target_camera, target_lights = configure_render(
+        scene, args.resolution, bounds_vertices, args.render_threads
+    )
+    sampled_indices = sampled_camera_indices(args.sample_id, clip_index)
+    target_camera_metadata_by_name = {}
+    for camera_index in sampled_indices:
+        view = camera_view(camera_index)
+        metadata = update_camera(scene, target_camera, target_lights, bounds_vertices, view)
+        target_camera_metadata_by_name[view["name"]] = metadata
+    target_camera_metadata = target_camera_metadata_by_name["camera_0"]
     final_root = args.output_root / Path(args.source_archive).parent / args.sample_id / str(clip_index)
     staging = args.output_root / ".staging" / Path(args.source_archive).parent / args.sample_id / str(clip_index)
     if staging.exists():
         shutil.rmtree(staging)
-    vertices_dir, images_dir, reference_dir = staging / "target_vertices", staging / "target_images", staging / "reference_views"
+    vertices_dir = staging / "target_vertices"
+    images_dir = staging / "target_images"
+    reference_dir = staging / "reference_views"
+    skeleton_dir = staging / "skeleton"
     for directory in (vertices_dir, images_dir, reference_dir):
         directory.mkdir(parents=True, exist_ok=True)
+    if skeleton:
+        skeleton_dir.mkdir(parents=True, exist_ok=True)
+        write_json(skeleton_dir / "metadata.json", {
+            **skeleton,
+            "source_frames": frames,
+            "frame_file_pattern": "frame_%04d.npy",
+            "dtype": "float32",
+            "frame_joint_matrices_shape": [skeleton["joint_count"], 4, 4],
+            "clip_joint_matrices_shape": [len(frames), skeleton["joint_count"], 4, 4],
+        })
+        for index, matrices in enumerate(animation_skeleton):
+            np.save(skeleton_dir / f"frame_{index:04d}.npy", matrices)
     # Recreate the exact state used to capture reference_vertices. For assets
     # without an armature, object actions remain active in REST mode, so using
     # the clip's first frame here would apply its object translation twice.
@@ -919,8 +1058,9 @@ def export_clip(
         if aligned_topology != topology or not np.array_equal(aligned_faces, faces):
             raise RuntimeError(f"Topology changed while aligning reference for clip {clip_index}")
         np.savez(staging / "reference_mesh.npz", vertices=aligned_reference, faces=faces)
+        update_camera(scene, target_camera, target_lights, bounds_vertices, camera_view(0))
         reference_camera = build_reference_camera(aligned_reference, target_camera_metadata)
-        scene.render.filepath = str(reference_dir / "front.png")
+        scene.render.filepath = str(reference_dir / "camera_0.png")
         bpy.ops.render.render(write_still=True)
     finally:
         if originals:
@@ -928,7 +1068,7 @@ def export_clip(
         set_armature_pose_position(scene, "POSE")
 
     reference_foreground = measure_reference_foreground(
-        reference_dir / "front.png", args.reference_background_pixel_threshold
+        reference_dir / "camera_0.png", args.reference_background_pixel_threshold
     )
     if reference_foreground["foreground_pixel_fraction"] <= args.min_reference_foreground:
         shutil.rmtree(staging)
@@ -945,31 +1085,46 @@ def export_clip(
         }
 
     reference_centroid = aligned_reference.mean(axis=0).astype(float).tolist()
-    rows, frame_metadata, image_paths = [], [], []
+    rows, frame_metadata_by_camera, image_paths_by_camera = [], {}, {}
+    frame_metadata = []
+    vertex_files = []
+    skeleton_files = []
     for index, (source_frame, vertices) in enumerate(zip(frames, animation_vertices)):
         scene.frame_set(source_frame)
         bpy.context.view_layer.update()
-        vertex_file, image_file = f"frame_{index:04d}.npy", f"frame_{index:04d}.png"
+        vertex_file = f"frame_{index:04d}.npy"
+        skeleton_file = f"frame_{index:04d}.npy" if skeleton else None
         np.save(vertices_dir / vertex_file, vertices)
-        camera_data = build_frame_camera(vertices, target_camera_metadata, view_direction)
-        scene.render.filepath = str(images_dir / image_file)
-        bpy.ops.render.render(write_still=True)
-        image_paths.append(images_dir / image_file)
-        frame_metadata.append({"frame_index": index, "source_frame": source_frame, **camera_data})
-        rows.append(build_sample_row(
-            args=args,
-            clip_index=clip_index,
-            frame_index=index,
-            source_frame=source_frame,
-            final_root=final_root,
-            reference_centroid=reference_centroid,
-            frame_centroid=vertices.mean(axis=0).astype(float).tolist(),
-            motion=motion,
-            vertex_file=vertex_file,
-            image_file=image_file,
-        ))
+        vertex_files.append(vertex_file)
+        skeleton_files.append(skeleton_file)
 
-    image_change = measure_image_change(image_paths, args.image_change_pixel_threshold)
+    for camera_index in sampled_indices:
+        view = camera_view(camera_index)
+        camera_name = view["name"]
+        camera_dir = images_dir / camera_name
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        update_camera(scene, target_camera, target_lights, bounds_vertices, view)
+        camera_metadata = target_camera_metadata_by_name[camera_name]
+        camera_frames = []
+        image_paths = []
+        for index, (source_frame, vertices) in enumerate(zip(frames, animation_vertices)):
+            scene.frame_set(source_frame)
+            bpy.context.view_layer.update()
+            image_file = f"frame_{index:04d}.png"
+            camera_data = build_frame_camera(vertices, camera_metadata)
+            scene.render.filepath = str(camera_dir / image_file)
+            bpy.ops.render.render(write_still=True)
+            image_paths.append(camera_dir / image_file)
+            camera_frames.append({"frame_index": index, "source_frame": source_frame, **camera_data})
+        frame_metadata_by_camera[camera_name] = camera_frames
+        image_paths_by_camera[camera_name] = image_paths
+
+    frame_metadata = frame_metadata_by_camera["camera_0"]
+    image_change_by_camera = {
+        camera_name: measure_image_change(paths, args.image_change_pixel_threshold)
+        for camera_name, paths in image_paths_by_camera.items()
+    }
+    image_change = image_change_by_camera["camera_0"]
     if image_change["mean_changed_pixel_fraction_per_frame"] <= args.min_image_change:
         shutil.rmtree(staging)
         return {
@@ -983,8 +1138,28 @@ def export_clip(
                 "passed": False,
             },
         }
+    for camera_index in sampled_indices:
+        camera_name = camera_view(camera_index)["name"]
+        for index, (source_frame, vertices) in enumerate(zip(frames, animation_vertices)):
+            rows.append(build_sample_row(
+                args=args,
+                clip_index=clip_index,
+                frame_index=index,
+                source_frame=source_frame,
+                final_root=final_root,
+                reference_centroid=reference_centroid,
+                frame_centroid=vertices.mean(axis=0).astype(float).tolist(),
+                motion=motion,
+                vertex_file=vertex_files[index],
+                image_file=f"frame_{index:04d}.png",
+                camera_index=camera_index,
+                camera_name=camera_name,
+                skeleton_file=skeleton_files[index],
+            ))
+
     for row in rows:
-        row["clip_mean_changed_pixel_fraction_per_frame"] = image_change[
+        row_image_change = image_change_by_camera[row["camera_name"]]
+        row["clip_mean_changed_pixel_fraction_per_frame"] = row_image_change[
             "mean_changed_pixel_fraction_per_frame"
         ]
         row["reference_foreground_pixel_fraction"] = reference_foreground[
@@ -1010,17 +1185,23 @@ def export_clip(
         reference_camera=reference_camera,
         target_camera=target_camera_metadata,
         frame_metadata=frame_metadata,
+        target_cameras=target_camera_metadata_by_name,
+        sampled_camera_indices=sampled_indices,
+        frame_metadata_by_camera=frame_metadata_by_camera,
+        image_change_by_camera=image_change_by_camera,
     )
     write_json(staging / "source_manifest.json", source_manifest)
     write_json(staging / "cameras.json", {
         "reference": {
-            "front": reference_camera,
+            "camera_0": reference_camera,
             "mode": "shared_with_clip_animation_union_bounds",
         },
         "target": {
-            "front": target_camera_metadata,
+            "camera_0": target_camera_metadata,
+            "views": target_camera_metadata_by_name,
+            "sampled_camera_indices": sampled_indices,
             "mode": "fixed_from_clip_animation_union_bounds",
-            "frames": frame_metadata,
+            "frames": frame_metadata_by_camera,
         },
     })
     write_jsonl(staging / "sample_manifest.jsonl", rows)
@@ -1034,6 +1215,7 @@ def export_clip(
         "frames": len(frames),
         "motion": motion,
         "image_change": image_change,
+        "image_change_by_camera": image_change_by_camera,
         "reference_foreground": reference_foreground,
         "output": str(final_root),
     }
@@ -1058,6 +1240,7 @@ def main() -> None:
     forced_opaque_materials = force_opaque_materials(meshes)
     depsgraph = bpy.context.evaluated_depsgraph_get()
     armatures = set_armature_pose_position(scene, "REST")
+    skeleton = skeleton_descriptor(scene, meshes)
     reference_source, faces, topology = evaluated_geometry(meshes, depsgraph)
     normalization = normalize_import(scene, meshes, reference_source.min(axis=0), reference_source.max(axis=0))
     reference_vertices, reference_faces, reference_topology = evaluated_geometry(meshes, depsgraph)
@@ -1080,6 +1263,7 @@ def main() -> None:
         armatures=armatures,
         reference_source_frame=reference_source_frame,
         normalization=normalization,
+        skeleton=skeleton,
     )
     # A corrupt/topology-changing clip must not discard other valid clips from
     # the same animation. Each clip is staged and published independently.

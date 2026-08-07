@@ -30,7 +30,7 @@ DEFAULT_LIBRARY_DIRS = [
 
 
 def paths_for(record: dict, root: Path) -> tuple[Path, Path, Path]:
-    shard = Path(record["archive"]).parent
+    shard = Path(record.get("shard", Path(record["archive"]).parent))
     raw_root = root / "animation" / "raw" / shard / record["id"]
     processed_root = root / "animation" / "processed" / shard / record["id"]
     status_path = root / "animation" / "status" / shard / f"{record['id']}.json"
@@ -46,6 +46,11 @@ def write_status(path: Path, value: dict) -> None:
 
 def extract_raw_asset(archive: Path, raw_root: Path, source_path: str, root: Path) -> Path:
     """Extract a complete archive atomically so restarts never consume partial data."""
+    if archive.suffix.lower() in {".fbx", ".glb"}:
+        if not archive.is_file():
+            raise RuntimeError(f"Source asset does not exist: {archive}")
+        raw_root.mkdir(parents=True, exist_ok=True)
+        return archive
     source = raw_root / source_path
     if source.is_file():
         return source
@@ -143,7 +148,10 @@ def process_record(record: dict, args: argparse.Namespace, gpu_id: str | None) -
 
     try:
         recover_or_remove_backup(processed_root)
-        archive = root / record["archive"]
+        archive_value = record.get("source_file", record["archive"])
+        archive = Path(archive_value)
+        if not archive.is_absolute():
+            archive = root / archive
         source = extract_raw_asset(archive, raw_root, record["source_path"], root)
         if staging_output.exists():
             shutil.rmtree(staging_output)
@@ -290,6 +298,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--inventory", type=Path)
+    parser.add_argument("--source-dir", type=Path)
     parser.add_argument("--blender", default=DEFAULT_BLENDER)
     parser.add_argument("--worker", type=Path, default=SCRIPT_DIR / "export_texverse_animation.py")
     parser.add_argument("--library-dir", action="append", default=DEFAULT_LIBRARY_DIRS)
@@ -317,7 +326,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    records = json.loads(args.inventory.read_text())["processable_records"]
+    if args.source_dir is not None:
+        source_files = sorted(
+            path for path in args.source_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in {".fbx", ".glb"}
+        )
+        records = [
+            {
+                "id": source.stem,
+                "archive": f"objects/{source.name}",
+                "source_file": str(source),
+                "source_path": source.name,
+                "shard": "objects",
+            }
+            for source in source_files
+        ]
+    else:
+        if args.inventory is None:
+            raise ValueError("--inventory is required unless --source-dir is provided")
+        records = json.loads(args.inventory.read_text())["processable_records"]
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
     gpu_ids = [value.strip() for value in args.gpu_ids.split(",") if value.strip()]
