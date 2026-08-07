@@ -1,7 +1,24 @@
 import math
 import unittest
 
-from pipeline_logic import CANONICAL_AXIS_ROTATIONS, snap_rotation_to_axis_aligned, split_clips
+from pipeline_logic import (
+    CANONICAL_AXIS_ROTATIONS,
+    reference_bbox_normalization_scale,
+    snap_rotation_to_axis_aligned,
+    split_clips,
+)
+
+
+class ReferenceBBoxTests(unittest.TestCase):
+    def test_uses_reference_bbox_largest_edge(self) -> None:
+        self.assertEqual(
+            reference_bbox_normalization_scale((-1.0, -2.0, -0.5), (1.0, 3.0, 0.5)),
+            5.0,
+        )
+
+    def test_rejects_degenerate_bbox(self) -> None:
+        with self.assertRaises(ValueError):
+            reference_bbox_normalization_scale((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
 
 
 class SplitClipsTests(unittest.TestCase):

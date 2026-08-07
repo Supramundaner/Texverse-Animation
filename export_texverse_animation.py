@@ -25,7 +25,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from pipeline_logic import PIPELINE_VERSION, snap_rotation_to_axis_aligned, split_clips
+from pipeline_logic import (
+    PIPELINE_VERSION,
+    reference_bbox_normalization_scale,
+    snap_rotation_to_axis_aligned,
+    split_clips,
+)
 
 
 NORMALIZED_MAX_EXTENT = 2.0
@@ -49,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-clips", type=int, default=6)
     parser.add_argument("--max-fps", type=float, default=16.0)
     parser.add_argument("--min-motion", type=float, default=0.01)
-    parser.add_argument("--min-image-change", type=float, default=0.001)
+    parser.add_argument("--max-centroid-motion-bbox-ratio", type=float, default=1.0)
+    parser.add_argument("--min-image-change", type=float, default=0.01)
     parser.add_argument("--image-change-pixel-threshold", type=int, default=10)
     parser.add_argument("--min-reference-foreground", type=float, default=0.05)
     parser.add_argument("--reference-background-pixel-threshold", type=int, default=10)
@@ -375,31 +381,58 @@ def evaluated_motion_state(meshes: list, depsgraph, topology: list[dict], vertex
     return values, centroid
 
 
-def measure_motion(meshes: list, depsgraph, topology: list[dict], frames: list[int], vertex_indices: np.ndarray) -> dict:
+def measure_motion(
+    meshes: list,
+    depsgraph,
+    topology: list[dict],
+    frames: list[int],
+    vertex_indices: np.ndarray,
+    reference_bbox_min: np.ndarray,
+    reference_bbox_max: np.ndarray,
+) -> dict:
+    reference_bbox_extent = reference_bbox_max - reference_bbox_min
+    reference_bbox_scale = reference_bbox_normalization_scale(
+        reference_bbox_min, reference_bbox_max
+    )
     previous_vertices = previous_centroid = None
+    first_centroid = None
     relative_steps: list[float] = []
     global_centroid_steps: list[float] = []
+    global_centroid_from_first: list[float] = []
     for source_frame in frames:
         bpy.context.scene.frame_set(source_frame)
         bpy.context.view_layer.update()
         current_vertices, current_centroid = evaluated_motion_state(meshes, depsgraph, topology, vertex_indices)
+        if first_centroid is None:
+            first_centroid = current_centroid.copy()
+        global_centroid_from_first.append(float(np.linalg.norm(current_centroid - first_centroid)))
         if previous_vertices is not None:
             # Remove whole-mesh translation before assessing deformation / articulated motion.
             previous_relative = previous_vertices - previous_centroid
             current_relative = current_vertices - current_centroid
-            relative_steps.append(float(np.linalg.norm(current_relative - previous_relative, axis=1).mean()))
+            relative_steps.append(float(
+                np.linalg.norm(
+                    (current_relative - previous_relative) / reference_bbox_scale,
+                    axis=1,
+                ).mean()
+            ))
             global_centroid_steps.append(float(np.linalg.norm(current_centroid - previous_centroid)))
         previous_vertices, previous_centroid = current_vertices, current_centroid
     return {
-        "method": "mean_euclidean_displacement_of_deterministic_vertex_sample_after_subtracting_each_frame_full_mesh_centroid",
+        "method": "mean_euclidean_displacement_normalized_by_reference_mesh_bbox_largest_edge_after_subtracting_each_frame_full_mesh_centroid",
         "frame_definition": "consecutive_exported_frames_after_fps_downsampling_and_frame_window_selection",
         "vertex_sample_count": int(len(vertex_indices)),
         "vertex_indices": vertex_indices.astype(int).tolist(),
+        "reference_bbox_min": reference_bbox_min.astype(float).tolist(),
+        "reference_bbox_max": reference_bbox_max.astype(float).tolist(),
+        "reference_bbox_extent": reference_bbox_extent.astype(float).tolist(),
+        "reference_bbox_normalization_scale": float(reference_bbox_scale),
         "step_count": len(relative_steps),
         "mean_per_point_per_frame": float(np.mean(relative_steps)) if relative_steps else 0.0,
         "step_mean_displacements": relative_steps,
         "global_centroid_motion_mean_per_frame": float(np.mean(global_centroid_steps)) if global_centroid_steps else 0.0,
         "global_centroid_step_displacements": global_centroid_steps,
+        "global_centroid_max_displacement_from_first": max(global_centroid_from_first, default=0.0),
         "space": "normalized_blender_world",
     }
 
@@ -760,6 +793,14 @@ def build_clip_manifest(
         "exported_source_frames": frames,
         "motion": motion,
         "motion_filter": {"min_motion": min_motion, "passed": True},
+        "centroid_motion_filter": {
+            "max_centroid_motion_bbox_ratio": motion.get("max_centroid_motion_bbox_ratio"),
+            "max_centroid_motion": motion.get("max_centroid_motion"),
+            "measured_centroid_max_displacement_from_first": motion.get(
+                "global_centroid_max_displacement_from_first"
+            ),
+            "passed": True,
+        },
         "image_change": image_change,
         "image_change_filter": {
             "min_mean_changed_pixel_fraction_per_frame": min_image_change,
@@ -801,20 +842,59 @@ def export_clip(
         if current_topology != topology or not np.array_equal(frame_faces, faces):
             raise RuntimeError(f"Topology changed in clip {clip_index} at frame {source_frame}")
         animation_vertices.append(vertices)
-    rng = np.random.default_rng(int(hashlib.sha256(f"{args.sample_id}:{clip_index}".encode()).hexdigest()[:16], 16))
-    indices = np.sort(rng.choice(len(reference_vertices), size=min(100, len(reference_vertices)), replace=False))
-    motion = measure_motion(meshes, depsgraph, topology, frames, indices)
-    if motion["mean_per_point_per_frame"] <= args.min_motion:
-        return {"status": "skipped_low_motion", "clip_index": clip_index, "motion": motion, "frames": len(frames)}
     first_vertices = animation_vertices[0]
-    # measure_motion leaves Blender evaluated at the final frame. Reference
-    # scale/alignment must instead use this clip's first animated frame.
+    # Reference scale/alignment is clip-specific and must be known before
+    # motion is normalized. Derive the bbox from the final exported reference,
+    # rather than from the animation's union bounds.
     scene.frame_set(frames[0])
     bpy.context.view_layer.update()
     reference_transform, reference_alignment = canonical_reference_transform(
         scene, meshes, reference_vertices, first_vertices.mean(axis=0)
     )
     reference_alignment["first_target_source_frame"] = frames[0]
+    transform_array = np.asarray(reference_transform, dtype=np.float32)
+    reference_homogeneous = np.concatenate(
+        (reference_vertices, np.ones((len(reference_vertices), 1), dtype=np.float32)), axis=1
+    )
+    aligned_reference_for_motion = (reference_homogeneous @ transform_array.T)[:, :3]
+    reference_bbox_min = aligned_reference_for_motion.min(axis=0)
+    reference_bbox_max = aligned_reference_for_motion.max(axis=0)
+
+    rng = np.random.default_rng(int(hashlib.sha256(f"{args.sample_id}:{clip_index}".encode()).hexdigest()[:16], 16))
+    indices = np.sort(rng.choice(len(reference_vertices), size=min(100, len(reference_vertices)), replace=False))
+    motion = measure_motion(
+        meshes,
+        depsgraph,
+        topology,
+        frames,
+        indices,
+        reference_bbox_min,
+        reference_bbox_max,
+    )
+    if motion["mean_per_point_per_frame"] <= args.min_motion:
+        return {"status": "skipped_low_motion", "clip_index": clip_index, "motion": motion, "frames": len(frames)}
+    centroid_motion_limit = (
+        motion["reference_bbox_normalization_scale"]
+        * args.max_centroid_motion_bbox_ratio
+    )
+    centroid_motion_filter = {
+        "max_centroid_motion_bbox_ratio": args.max_centroid_motion_bbox_ratio,
+        "max_centroid_motion": centroid_motion_limit,
+        "measured_centroid_max_displacement_from_first": motion[
+            "global_centroid_max_displacement_from_first"
+        ],
+        "passed": motion["global_centroid_max_displacement_from_first"] <= centroid_motion_limit,
+    }
+    motion["max_centroid_motion_bbox_ratio"] = float(args.max_centroid_motion_bbox_ratio)
+    motion["max_centroid_motion"] = float(centroid_motion_limit)
+    if not centroid_motion_filter["passed"]:
+        return {
+            "status": "skipped_excessive_centroid_motion",
+            "clip_index": clip_index,
+            "frames": len(frames),
+            "motion": motion,
+            "centroid_motion_filter": centroid_motion_filter,
+        }
     bounds_min = np.min([vertices.min(axis=0) for vertices in animation_vertices], axis=0)
     bounds_max = np.max([vertices.max(axis=0) for vertices in animation_vertices], axis=0)
     bounds_vertices = np.stack((bounds_min, bounds_max))
@@ -963,6 +1043,8 @@ def main() -> None:
     args = parse_args()
     if not 0.0 <= args.min_image_change <= 1.0:
         raise ValueError("--min-image-change must be between 0 and 1")
+    if args.max_centroid_motion_bbox_ratio < 0.0:
+        raise ValueError("--max-centroid-motion-bbox-ratio must be non-negative")
     if not 0 <= args.image_change_pixel_threshold <= 255:
         raise ValueError("--image-change-pixel-threshold must be between 0 and 255")
     if not 0.0 <= args.min_reference_foreground <= 1.0:

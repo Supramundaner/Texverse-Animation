@@ -10,9 +10,12 @@ renders, cameras, and manifests.
 - Downsample source animation to at most 16 FPS.
 - Select at most one deterministic contiguous 96-frame window.
 - Split the selected window into at most six clips of at most 16 frames.
-- Keep a clip only when de-centered sampled-vertex motion is greater than 0.01.
+- Keep a clip only when de-centered sampled-vertex motion, normalized by the
+  reference mesh bounding box's largest edge, is greater than 0.01.
+- Keep a clip only when its maximum centroid excursion from the first target
+  frame does not exceed one reference-pose bounding-box edge.
 - After rendering, keep a clip only when consecutive target frames change at
-  least 0.1% of pixels on average, using a maximum RGB-channel delta of 10/255.
+  least 1.0% of pixels on average, using a maximum RGB-channel delta of 10/255.
 - Before rendering target frames, keep a clip only when at least 5% of its
   reference pixels differ from the median border background by more than 10/255.
 - Compute reference alignment, camera bounds, validity, and renders independently

@@ -8,7 +8,25 @@ from itertools import permutations, product
 from typing import Sequence
 
 
-PIPELINE_VERSION = "texverse-animation-v20"
+PIPELINE_VERSION = "texverse-animation-v23"
+
+
+def reference_bbox_normalization_scale(
+    minimum: Sequence[float],
+    maximum: Sequence[float],
+) -> float:
+    """Return the reference mesh bbox's largest edge for motion normalization."""
+    if len(minimum) != 3 or len(maximum) != 3:
+        raise ValueError("reference bbox bounds must contain three coordinates")
+    extents = [float(high) - float(low) for low, high in zip(minimum, maximum)]
+    if not all(math.isfinite(value) for value in extents):
+        raise ValueError("reference bbox bounds must be finite")
+    if any(value < 0.0 for value in extents):
+        raise ValueError("reference bbox minimum must not exceed maximum")
+    scale = max(extents)
+    if scale <= 0.0:
+        raise ValueError("reference bbox must have a positive extent")
+    return scale
 
 
 def _permutation_sign(permutation: tuple[int, int, int]) -> int:

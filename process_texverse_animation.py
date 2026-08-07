@@ -75,6 +75,7 @@ def processing_config(args: argparse.Namespace) -> dict:
         "max_clips": args.max_clips,
         "max_fps": args.max_fps,
         "min_motion": args.min_motion,
+        "max_centroid_motion_bbox_ratio": args.max_centroid_motion_bbox_ratio,
         "min_image_change": args.min_image_change,
         "image_change_pixel_threshold": args.image_change_pixel_threshold,
         "min_reference_foreground": args.min_reference_foreground,
@@ -186,6 +187,8 @@ def process_record(record: dict, args: argparse.Namespace, gpu_id: str | None) -
             str(args.max_fps),
             "--min-motion",
             str(args.min_motion),
+            "--max-centroid-motion-bbox-ratio",
+            str(args.max_centroid_motion_bbox_ratio),
             "--min-image-change",
             str(args.min_image_change),
             "--image-change-pixel-threshold",
@@ -296,7 +299,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-clips", type=int, default=6)
     parser.add_argument("--max-fps", type=float, default=16.0)
     parser.add_argument("--min-motion", type=float, default=0.01)
-    parser.add_argument("--min-image-change", type=float, default=0.001)
+    parser.add_argument("--max-centroid-motion-bbox-ratio", type=float, default=1.0)
+    parser.add_argument("--min-image-change", type=float, default=0.01)
     parser.add_argument("--image-change-pixel-threshold", type=int, default=10)
     parser.add_argument("--min-reference-foreground", type=float, default=0.05)
     parser.add_argument("--reference-background-pixel-threshold", type=int, default=10)
