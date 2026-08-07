@@ -561,6 +561,13 @@ def sampled_frames(scene, maximum_fps: float, frame_start: int, frame_end: int) 
 
 
 CAMERA_COUNT = 12
+TRAINING_LIGHT_RIG = (
+    ("front", (0.0, -1.0, 0.65), 360.0),
+    ("back", (0.0, 1.0, 0.65), 300.0),
+    ("left", (-1.0, 0.0, 0.65), 330.0),
+    ("right", (1.0, 0.0, 0.65), 330.0),
+    ("top", (0.0, 0.0, 1.0), 400.0),
+)
 
 
 def sampled_camera_indices(sample_id: str, clip_index: int) -> list[int]:
@@ -639,7 +646,8 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
     camera_data.clip_end = 100.0
     scene.camera = camera
     lights = []
-    for name, energy in (("Key", 1200.0), ("Fill", 600.0)):
+    for role, _, energy in TRAINING_LIGHT_RIG:
+        name = f"TexVerse_{role.title()}"
         light_data = bpy.data.lights.new(name, "AREA")
         light_data.energy = energy
         light_data.shape = "DISK"
@@ -647,7 +655,6 @@ def configure_render(scene, resolution: int, vertices: np.ndarray, render_thread
         light = bpy.data.objects.new(name, light_data)
         scene.collection.objects.link(light)
         light["texverse_export_helper"] = True
-        role = "key" if name == "Key" else "fill"
         light.location = tuple(center)
         light.rotation_euler = (Vector(center) - light.location).to_track_quat("-Z", "Y").to_euler()
         lights.append((light, role))
@@ -683,11 +690,17 @@ def update_camera(scene, camera, lights: list, vertices: np.ndarray, view: dict)
     camera.location = tuple(center + view["offset"] * distance)
     camera.rotation_euler = (Vector(center) - camera.location).to_track_quat("-Z", "Y").to_euler()
     camera.data.clip_end = max(100.0, distance * 4.0)
-    # Keep illumination relative to each independently framed mesh pose.
-    key_offset = -2.0 * view["right"] - 2.0 * view["offset"] + 3.0 * view["up"]
-    fill_offset = 2.0 * view["right"] - view["offset"] + view["up"]
-    offsets = {"key": key_offset, "fill": fill_offset}
+    # Use the same world-space soft-light rig for every camera so view changes
+    # do not also change the illumination distribution.
+    extent = maximum - minimum
+    light_radius = max(3.0, float(extent.max()) * 2.0)
+    light_size = max(4.0, float(extent.max()) * 2.5)
+    offsets = {
+        role: np.asarray(direction, dtype=np.float32) * light_radius
+        for role, direction, _ in TRAINING_LIGHT_RIG
+    }
     for light, role in lights:
+        light.data.size = light_size
         light.location = tuple(center + offsets[role])
         light.rotation_euler = (Vector(center) - light.location).to_track_quat("-Z", "Y").to_euler()
     bpy.context.view_layer.update()
@@ -873,6 +886,17 @@ def build_common_metadata(
             "target_camera_mode": "fixed_from_clip_animation_union_bounds",
             "target_camera_count": CAMERA_COUNT,
             "target_camera_sampling": "camera_0_plus_one_deterministic_view_from_camera_1_to_camera_11",
+            "lighting": {
+                "mode": "camera_independent_world_space_soft_lights",
+                "area_lights": [
+                    {"role": role, "direction": list(direction), "energy": energy}
+                    for role, direction, energy in TRAINING_LIGHT_RIG
+                ],
+                "light_radius": "max(3.0, animation_bbox_largest_edge * 2.0)",
+                "light_size": "max(4.0, animation_bbox_largest_edge * 2.5)",
+                "world_color_linear_rgba": [0.15, 0.15, 0.15, 1.0],
+                "world_strength": 0.35,
+            },
             "forced_opaque_material_count": forced_opaque_materials,
         },
         "mesh_filter": mesh_filter,

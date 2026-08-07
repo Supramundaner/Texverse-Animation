@@ -21,6 +21,9 @@ renders, cameras, and manifests.
 - Render target images from `camera_0` (front, negative Y) and one deterministic
   extra view sampled from `camera_1` through `camera_11`; the twelve camera
   positions are spaced every 30 degrees around world Z.
+- Use a camera-independent training light rig with four world-space horizontal
+  soft lights, one top soft light, and neutral gray environment fill. Every
+  camera sees the same illumination distribution.
 - Compute reference alignment, camera bounds, validity, and renders independently
   for every clip.
 - Fit the fixed clip camera using Blender's effective square-frame projection,
