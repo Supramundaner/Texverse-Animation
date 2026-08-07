@@ -9,7 +9,7 @@ from itertools import permutations, product
 from typing import Sequence
 
 
-PIPELINE_VERSION = "texverse-animation-v28"
+PIPELINE_VERSION = "texverse-animation-v29"
 
 
 def _permutation_sign(permutation: tuple[int, int, int]) -> int:
@@ -71,6 +71,14 @@ def sampled_orbit_camera_indices(
         raise ValueError("camera_count must be at least 2")
     digest = hashlib.sha256(f"{sample_id}:{clip_index}:camera".encode()).hexdigest()
     return [0, 1 + (int(digest[:16], 16) % (camera_count - 1))]
+
+
+def sampled_lighting_preset_index(sample_id: str, clip_index: int, preset_count: int) -> int:
+    """Choose one lighting preset deterministically for a sample clip."""
+    if preset_count < 1:
+        raise ValueError("preset_count must be positive")
+    digest = hashlib.sha256(f"{sample_id}:{clip_index}:lighting".encode()).hexdigest()
+    return int(digest[:16], 16) % preset_count
 
 
 def reference_bbox_normalization_scale(

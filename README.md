@@ -22,8 +22,10 @@ renders, cameras, and manifests.
   extra view sampled from `camera_1` through `camera_11`; the twelve camera
   positions are spaced every 30 degrees around world Z.
 - Use a camera-independent training light rig with four world-space horizontal
-  soft lights, one top soft light, and neutral gray environment fill. Every
-  camera sees the same illumination distribution.
+  soft lights and one top soft light. A deterministic preset is sampled per
+  clip for lighting diversity; the environment and rendered background are black.
+- Reference meshes use their own transformed bbox camera and are centered at the
+  origin. Target animation frame 0 is also centered at the origin per clip.
 - Compute reference alignment, camera bounds, validity, and renders independently
   for every clip.
 - Fit the fixed clip camera using Blender's effective square-frame projection,
