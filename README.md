@@ -26,8 +26,10 @@ renders, cameras, and manifests.
 - Fit the fixed clip camera using Blender's effective square-frame projection,
   with five percent safety margin per limiting image edge.
 - For rigged assets, align REST-pose root scale to the first animation frame and
-  align its horizontal (world-Z) facing direction to the nearest 90-degree
-  canonical yaw of that first frame. Pitch and roll are preserved.
+  align its complete 3D orientation to the nearest of the 24 right-handed,
+  axis-aligned 90-degree canonical rotations of that first frame. The alignment
+  bone is the hierarchy-shallowest animated bone, avoiding static virtual roots;
+  only the reference pose receives this transform.
 - For unrigged assets, restore the original imported reference frame before
   applying per-clip alignment.
 
@@ -35,7 +37,7 @@ renders, cameras, and manifests.
 
 - `export_texverse_animation.py`: Blender worker for one asset.
 - `process_texverse_animation.py`: resumable multi-process supervisor.
-- `pipeline_logic.py`: dependency-free clip and canonical-yaw rules.
+- `pipeline_logic.py`: dependency-free clip and canonical-orientation rules.
 - `run_texverse_animation_batch.sh`: default four-worker launcher.
 - `tests/`: unit tests that do not require Blender.
 
