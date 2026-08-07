@@ -148,7 +148,8 @@ def select_meshes(scene) -> tuple[list, dict]:
         selected = [obj for obj in meshes if not is_scene_mesh(obj, median_scale)]
         method = "all_meshes_excluding_named_or_large_thin_scene_meshes"
     if not selected:
-        raise RuntimeError("Scene-mesh filtering removed every renderable mesh")
+        selected = meshes
+        method = "all_renderable_meshes_fallback_scene_filter_would_remove_everything"
     removed = sorted(obj.name for obj in meshes if obj not in selected)
     for obj in meshes:
         if obj not in selected:
