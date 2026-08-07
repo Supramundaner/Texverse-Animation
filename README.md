@@ -30,11 +30,11 @@ renders, cameras, and manifests.
   for every clip.
 - Fit the fixed clip camera using Blender's effective square-frame projection,
   with five percent safety margin per limiting image edge.
-- For rigged assets, align REST-pose root scale to the first animation frame and
-  align its complete 3D orientation to the nearest of the 24 right-handed,
-  axis-aligned 90-degree canonical rotations of that first frame. The alignment
-  bone is the hierarchy-shallowest animated bone, avoiding static virtual roots;
-  only the reference pose receives this transform.
+- For rigged assets, align REST-pose root scale to the first animation frame.
+  Select reference orientation directly from the 24 right-handed, axis-aligned
+  rotations by minimizing centered corresponding-vertex error against the first
+  target frame. This avoids relying on rig-specific controller-bone axes; only
+  the reference pose receives the selected transform.
 - For unrigged assets, restore the original imported reference frame before
   applying per-clip alignment.
 

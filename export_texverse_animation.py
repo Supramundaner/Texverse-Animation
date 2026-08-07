@@ -26,14 +26,14 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from pipeline_logic import (
+    CANONICAL_AXIS_ROTATIONS,
     PIPELINE_VERSION,
     reference_bbox_normalization_scale,
     sampled_orbit_camera_indices,
     sampled_lighting_preset_index,
-    snap_rotation_to_axis_aligned,
     split_clips,
 )
-from geometry_logic import origin_centering_translation
+from geometry_logic import best_axis_aligned_rotation, origin_centering_translation
 
 
 NORMALIZED_MAX_EXTENT = 2.0
@@ -325,21 +325,17 @@ def canonical_reference_transform(
     scene,
     meshes: list,
     reference_vertices: np.ndarray,
+    first_target_vertices: np.ndarray,
     target_centroid: np.ndarray,
 ) -> tuple[Matrix, dict]:
-    """Align REST to the nearest 3D axis-aligned rotation of the first pose."""
+    """Align REST geometry to the first pose with one of 24 axis rotations."""
     rest_matrix, root_metadata = root_joint_alignment(scene, meshes)
     reference_centroid = centroid64(reference_vertices)
     scale_factor = 1.0
-    rest_rotation = first_target_rotation = canonical_target_rotation = None
-    canonical_rotation_index = None
-    canonical_target_axes = None
+    rest_rotation = first_target_rotation = None
+    pose_matrix = None
 
-    if root_metadata.get("applied") is False:
-        rotation = Matrix.Identity(4)
-        method = "translation_only_no_armature"
-        pose_matrix = None
-    else:
+    if root_metadata.get("applied") is not False:
         pose_matrix = root_joint_pose_matrix(scene, root_metadata["armature"], root_metadata["bone"])
         rest_scale = np.asarray(rest_matrix.to_scale(), dtype=np.float32)
         pose_scale = np.asarray(pose_matrix.to_scale(), dtype=np.float32)
@@ -349,12 +345,25 @@ def canonical_reference_transform(
 
         rest_rotation = rest_matrix.to_quaternion().to_matrix()
         first_target_rotation = pose_matrix.to_quaternion().to_matrix()
-        snapped, canonical_rotation_index, canonical_target_axes = snap_rotation_to_axis_aligned(
-            first_target_rotation
-        )
-        canonical_target_rotation = Matrix(snapped)
-        rotation = (canonical_target_rotation @ rest_rotation.inverted()).to_4x4()
-        method = "align_rest_root_to_nearest_3d_axis_rotation_of_first_target_root_then_match_centroid"
+
+    rotation_array, canonical_rotation_index, geometry_alignment = best_axis_aligned_rotation(
+        reference_vertices,
+        first_target_vertices,
+        [candidate for candidate, _ in CANONICAL_AXIS_ROTATIONS],
+    )
+    canonical_target_axes = CANONICAL_AXIS_ROTATIONS[canonical_rotation_index][1]
+    rotation = Matrix(rotation_array).to_4x4()
+    method = "align_rest_mesh_to_first_target_by_best_of_24_axis_rotations_then_match_centroid"
+
+    reference_centered = np.asarray(reference_vertices, dtype=np.float64) - reference_centroid
+    target_centered = (
+        np.asarray(first_target_vertices, dtype=np.float64)
+        - centroid64(first_target_vertices)
+    )
+    scaled_aligned = scale_factor * (reference_centered @ rotation_array.T)
+    geometry_alignment["rms_error_after_root_scale"] = float(
+        np.sqrt(np.mean(np.sum((scaled_aligned - target_centered) ** 2, axis=1)))
+    )
 
     transform = (
         Matrix.Translation(Vector(target_centroid))
@@ -368,16 +377,20 @@ def canonical_reference_transform(
         "root": root_metadata,
         "rest_root_rotation": matrix_to_list(rest_rotation) if rest_rotation is not None else None,
         "first_target_root_rotation": matrix_to_list(first_target_rotation) if first_target_rotation is not None else None,
-        "canonical_target_rotation": matrix_to_list(canonical_target_rotation) if canonical_target_rotation is not None else None,
+        "canonical_target_rotation": matrix_to_list(rotation_array),
         "canonical_target_axes": list(canonical_target_axes) if canonical_target_axes is not None else None,
         "canonical_rotation_index": canonical_rotation_index,
         "applied_rotation": matrix_to_list(rotation),
+        "orientation_selection": geometry_alignment,
         "reference_uniform_scale": scale_factor,
         "root_rest_scale": [float(value) for value in rest_matrix.to_scale()],
         "root_first_target_scale": (
             [float(value) for value in pose_matrix.to_scale()] if pose_matrix is not None else None
         ),
         "reference_centroid_before": reference_centroid.astype(float).tolist(),
+        "first_target_centroid_before_output_centering": (
+            centroid64(first_target_vertices).astype(float).tolist()
+        ),
         "first_target_centroid": target_centroid.astype(float).tolist(),
         "reference_transform": [[float(value) for value in row] for row in transform],
     }
@@ -1104,7 +1117,7 @@ def export_clip(
     scene.frame_set(frames[0])
     bpy.context.view_layer.update()
     reference_transform, reference_alignment = canonical_reference_transform(
-        scene, meshes, reference_vertices, np.zeros(3, dtype=np.float32)
+        scene, meshes, reference_vertices, first_vertices, np.zeros(3, dtype=np.float32)
     )
     reference_alignment["first_target_source_frame"] = frames[0]
     transform_array = np.asarray(reference_transform, dtype=np.float32)
