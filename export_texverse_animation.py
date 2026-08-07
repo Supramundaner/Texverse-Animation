@@ -1212,19 +1212,17 @@ def export_clip(
     originals = []
     try:
         originals = apply_reference_transform(scene, reference_transform)
-        # Stateful modifiers can make the actual REST geometry differ slightly
-        # from the snapshot used to derive the canonical rotation. Keep that
-        # rotation, then solve translation against the geometry being exported.
-        for _ in range(4):
-            aligned_reference, aligned_faces, aligned_topology = evaluated_geometry(meshes, depsgraph)
-            residual = centroid64(aligned_reference)
-            if float(np.linalg.norm(residual)) <= ORIGIN_CENTROID_TOLERANCE:
-                break
-            reference_transform = Matrix.Translation(-Vector(residual)) @ reference_transform
-            replace_applied_transform(originals, reference_transform)
         aligned_reference, aligned_faces, aligned_topology = evaluated_geometry(meshes, depsgraph)
         if aligned_topology != topology or not np.array_equal(aligned_faces, faces):
             raise RuntimeError(f"Topology changed while aligning reference for clip {clip_index}")
+        # Stateful modifiers can drift across repeated depsgraph evaluations.
+        # Center the exact snapshot being written, and apply the same final
+        # translation to the scene without evaluating the exported array again.
+        reference_output_transform = np.eye(4, dtype=np.float64)
+        reference_output_transform[:3, 3] = origin_centering_translation(aligned_reference)
+        aligned_reference = transform_vertices(aligned_reference, reference_output_transform)
+        reference_transform = Matrix(reference_output_transform.tolist()) @ reference_transform
+        replace_applied_transform(originals, reference_transform)
         reference_centroid_array = require_origin_centroid(
             f"clip {clip_index} reference", aligned_reference
         )
@@ -1233,6 +1231,9 @@ def export_clip(
             reference_centroid_array.astype(float).tolist()
         )
         reference_alignment["origin_centroid_tolerance"] = ORIGIN_CENTROID_TOLERANCE
+        reference_alignment["output_centering_translation"] = (
+            reference_output_transform[:3, 3].astype(float).tolist()
+        )
         np.savez(staging / "reference_mesh.npz", vertices=aligned_reference, faces=faces)
         reference_bounds_vertices = np.stack(
             (aligned_reference.min(axis=0), aligned_reference.max(axis=0))
