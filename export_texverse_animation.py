@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Export one normalized TexVerse FBX/GLB asset into LTA-style mesh frames.
 
-Run with Blender. The asset is normalized as a whole, but its reference and
-animated mesh centroids are recorded rather than root-aligned.
+Run with Blender. The asset is normalized as a whole. Each exported reference
+and the first target frame of each clip are centered at the origin.
 """
 
 from __future__ import annotations
@@ -33,9 +33,11 @@ from pipeline_logic import (
     snap_rotation_to_axis_aligned,
     split_clips,
 )
+from geometry_logic import origin_centering_translation
 
 
 NORMALIZED_MAX_EXTENT = 2.0
+ORIGIN_CENTROID_TOLERANCE = 1e-5
 
 
 def matrix_to_list(matrix: Matrix) -> list[list[float]]:
@@ -44,15 +46,32 @@ def matrix_to_list(matrix: Matrix) -> list[list[float]]:
 
 def transform_vertices(vertices: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Apply a homogeneous transform to an exported vertex array."""
+    values = np.asarray(vertices, dtype=np.float64)
+    matrix = np.asarray(transform, dtype=np.float64)
     homogeneous = np.concatenate(
-        (vertices, np.ones((len(vertices), 1), dtype=np.float32)), axis=1
+        (values, np.ones((len(values), 1), dtype=np.float64)), axis=1
     )
-    return (homogeneous @ transform.T)[:, :3].astype(np.float32)
+    return (homogeneous @ matrix.T)[:, :3].astype(np.float32)
 
 
 def transform_skeleton_matrices(matrices: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Apply an output-space world transform to global joint matrices."""
     return np.matmul(transform[np.newaxis, :, :], matrices).astype(np.float32)
+
+
+def centroid64(vertices: np.ndarray) -> np.ndarray:
+    return np.asarray(vertices).mean(axis=0, dtype=np.float64)
+
+
+def require_origin_centroid(label: str, vertices: np.ndarray) -> np.ndarray:
+    centroid = centroid64(vertices)
+    displacement = float(np.linalg.norm(centroid))
+    if displacement > ORIGIN_CENTROID_TOLERANCE:
+        raise RuntimeError(
+            f"{label} centroid is not at the origin: {centroid.tolist()} "
+            f"(norm={displacement}, tolerance={ORIGIN_CENTROID_TOLERANCE})"
+        )
+    return centroid
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-id", required=True)
     parser.add_argument("--source-archive", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--published-output-root", type=Path)
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--clip-frames", type=int, default=16)
@@ -309,7 +329,7 @@ def canonical_reference_transform(
 ) -> tuple[Matrix, dict]:
     """Align REST to the nearest 3D axis-aligned rotation of the first pose."""
     rest_matrix, root_metadata = root_joint_alignment(scene, meshes)
-    reference_centroid = reference_vertices.mean(axis=0)
+    reference_centroid = centroid64(reference_vertices)
     scale_factor = 1.0
     rest_rotation = first_target_rotation = canonical_target_rotation = None
     canonical_rotation_index = None
@@ -372,6 +392,15 @@ def apply_reference_transform(scene, transform: Matrix) -> list[tuple[object, Ma
         obj.matrix_world = transform @ original
     bpy.context.view_layer.update()
     return originals
+
+
+def replace_applied_transform(
+    originals: list[tuple[object, Matrix]], transform: Matrix
+) -> None:
+    """Replace a temporary scene-wide transform without accumulating error."""
+    for obj, original in originals:
+        obj.matrix_world = transform @ original
+    bpy.context.view_layer.update()
 
 
 def restore_reference_transform(originals: list[tuple[object, Matrix]]) -> None:
@@ -1016,7 +1045,7 @@ def build_clip_manifest(
         "face_count": int(len(faces)),
         "reference_mesh": str(final_root / "reference_mesh.npz"),
         "reference_image": str(final_root / "reference_views" / "camera_0.png"),
-        "reference_centroid": aligned_reference.mean(axis=0).astype(float).tolist(),
+        "reference_centroid": centroid64(aligned_reference).astype(float).tolist(),
         "reference_alignment": reference_alignment,
         "animation_union_bounds": {
             "min": bounds_min.astype(float).tolist(),
@@ -1121,12 +1150,12 @@ def export_clip(
             "motion": motion,
             "centroid_motion_filter": centroid_motion_filter,
         }
-    target_center = first_vertices.mean(axis=0).astype(np.float32)
-    target_translation = np.eye(4, dtype=np.float32)
-    target_translation[:3, 3] = -target_center
+    target_translation = np.eye(4, dtype=np.float64)
+    target_translation[:3, 3] = origin_centering_translation(first_vertices)
     exported_animation_vertices = [
         transform_vertices(vertices, target_translation) for vertices in animation_vertices
     ]
+    require_origin_centroid(f"clip {clip_index} target frame 0", exported_animation_vertices[0])
     exported_animation_skeleton = [
         transform_skeleton_matrices(matrices, target_translation)
         for matrices in animation_skeleton
@@ -1147,6 +1176,13 @@ def export_clip(
         target_camera_metadata_by_name[view["name"]] = metadata
     target_camera_metadata = target_camera_metadata_by_name["camera_0"]
     final_root = args.output_root / Path(args.source_archive).parent / args.sample_id / str(clip_index)
+    published_output_root = args.published_output_root or args.output_root
+    manifest_root = (
+        published_output_root
+        / Path(args.source_archive).parent
+        / args.sample_id
+        / str(clip_index)
+    )
     staging = args.output_root / ".staging" / Path(args.source_archive).parent / args.sample_id / str(clip_index)
     if staging.exists():
         shutil.rmtree(staging)
@@ -1176,9 +1212,27 @@ def export_clip(
     originals = []
     try:
         originals = apply_reference_transform(scene, reference_transform)
+        # Stateful modifiers can make the actual REST geometry differ slightly
+        # from the snapshot used to derive the canonical rotation. Keep that
+        # rotation, then solve translation against the geometry being exported.
+        for _ in range(4):
+            aligned_reference, aligned_faces, aligned_topology = evaluated_geometry(meshes, depsgraph)
+            residual = centroid64(aligned_reference)
+            if float(np.linalg.norm(residual)) <= ORIGIN_CENTROID_TOLERANCE:
+                break
+            reference_transform = Matrix.Translation(-Vector(residual)) @ reference_transform
+            replace_applied_transform(originals, reference_transform)
         aligned_reference, aligned_faces, aligned_topology = evaluated_geometry(meshes, depsgraph)
         if aligned_topology != topology or not np.array_equal(aligned_faces, faces):
             raise RuntimeError(f"Topology changed while aligning reference for clip {clip_index}")
+        reference_centroid_array = require_origin_centroid(
+            f"clip {clip_index} reference", aligned_reference
+        )
+        reference_alignment["reference_transform"] = matrix_to_list(reference_transform)
+        reference_alignment["exported_reference_centroid"] = (
+            reference_centroid_array.astype(float).tolist()
+        )
+        reference_alignment["origin_centroid_tolerance"] = ORIGIN_CENTROID_TOLERANCE
         np.savez(staging / "reference_mesh.npz", vertices=aligned_reference, faces=faces)
         reference_bounds_vertices = np.stack(
             (aligned_reference.min(axis=0), aligned_reference.max(axis=0))
@@ -1211,7 +1265,7 @@ def export_clip(
             },
         }
 
-    reference_centroid = aligned_reference.mean(axis=0).astype(float).tolist()
+    reference_centroid = centroid64(aligned_reference).astype(float).tolist()
     rows, frame_metadata_by_camera, image_paths_by_camera = [], {}, {}
     frame_metadata = []
     vertex_files = []
@@ -1277,9 +1331,9 @@ def export_clip(
                 clip_index=clip_index,
                 frame_index=index,
                 source_frame=source_frame,
-                final_root=final_root,
+                final_root=manifest_root,
                 reference_centroid=reference_centroid,
-                frame_centroid=vertices.mean(axis=0).astype(float).tolist(),
+                frame_centroid=centroid64(vertices).astype(float).tolist(),
                 motion=motion,
                 vertex_file=vertex_files[index],
                 image_file=f"frame_{index:04d}.png",
@@ -1309,7 +1363,7 @@ def export_clip(
         min_reference_foreground=args.min_reference_foreground,
         aligned_reference=aligned_reference,
         faces=faces,
-        final_root=final_root,
+        final_root=manifest_root,
         reference_alignment=reference_alignment,
         bounds_min=bounds_min,
         bounds_max=bounds_max,
@@ -1325,7 +1379,7 @@ def export_clip(
     write_json(staging / "cameras.json", {
         "reference": {
             "camera_0": reference_camera,
-            "mode": "shared_with_clip_animation_union_bounds",
+            "mode": "reference_from_reference_mesh_bbox",
         },
         "target": {
             "camera_0": target_camera_metadata,

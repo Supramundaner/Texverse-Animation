@@ -183,6 +183,8 @@ def process_record(record: dict, args: argparse.Namespace, gpu_id: str | None) -
             record["archive"],
             "--output-root",
             str(staging_output),
+            "--published-output-root",
+            str(root / "animation" / "processed"),
             "--raw-root",
             str(root / "animation" / "raw"),
             "--resolution",

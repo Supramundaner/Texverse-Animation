@@ -43,6 +43,7 @@ renders, cameras, and manifests.
 - `export_texverse_animation.py`: Blender worker for one asset.
 - `process_texverse_animation.py`: resumable multi-process supervisor.
 - `pipeline_logic.py`: dependency-free clip and canonical-orientation rules.
+- `geometry_logic.py`: high-precision output-centering rules.
 - `run_texverse_animation_batch.sh`: default four-worker launcher.
 - `tests/`: unit tests that do not require Blender.
 
